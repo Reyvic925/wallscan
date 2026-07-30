@@ -32,23 +32,23 @@ ALERT_MAX_PER_HOUR = int(os.environ.get("ALERT_MAX_PER_HOUR", "5"))
 
 MAX_WORKERS = max(1, int(os.environ.get("MAX_WORKERS", "3")))
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "300"))
-NUM_ADDRESSES = int(os.environ.get("NUM_ADDRESSES", "5"))  # Reduced from 20 for speed
+NUM_ADDRESSES = int(os.environ.get("NUM_ADDRESSES", "5"))   # Faster
 
 def parse_keys(env_var: str) -> List[str]:
+    """Split comma-separated keys, strip whitespace, ignore empty."""
     return [k.strip() for k in env_var.split(",") if k.strip()]
 
+# ----- API Keys – support both ETHERSCAN_KEYS and ETHERSCAN_KEY -----
 if BLOCKCHAIN == "ethereum":
-    ETHERSCAN_KEYS = parse_keys(os.environ.get("ETHERSCAN_KEYS", "")) or (
-        [os.environ.get("ETHERSCAN_KEY", "")] if os.environ.get("ETHERSCAN_KEY", "") else []
-    )
+    keys_from_old = parse_keys(os.environ.get("ETHERSCAN_KEY", ""))
+    ETHERSCAN_KEYS = parse_keys(os.environ.get("ETHERSCAN_KEYS", "")) or keys_from_old
     if not ETHERSCAN_KEYS:
         logging.warning("No Etherscan API keys provided.")
     else:
         logging.info(f"Loaded {len(ETHERSCAN_KEYS)} Etherscan API keys")
 elif BLOCKCHAIN == "bsc":
-    BSCSCAN_KEYS = parse_keys(os.environ.get("BSCSCAN_KEYS", "")) or (
-        [os.environ.get("BSCSCAN_KEY", "")] if os.environ.get("BSCSCAN_KEY", "") else []
-    )
+    keys_from_old = parse_keys(os.environ.get("BSCSCAN_KEY", ""))
+    BSCSCAN_KEYS = parse_keys(os.environ.get("BSCSCAN_KEYS", "")) or keys_from_old
     if not BSCSCAN_KEYS:
         logging.warning("No BscScan API keys provided.")
 
@@ -91,7 +91,6 @@ class KeyRotator:
         self.keys = keys
         self.index = 0
         self._lock = asyncio.Lock()
-        logger.info(f"🔑 KeyRotator initialized with {len(keys)} keys")
 
     async def get_key(self) -> Optional[str]:
         if not self.keys:
@@ -211,7 +210,7 @@ class WalletScanner:
             coin_type = 0 if BLOCKCHAIN == "bitcoin" else (60 if BLOCKCHAIN == "ethereum" else 714)
             addresses = []
             for change in (0,):
-                for idx in range(NUM_ADDRESSES):  # Configurable, default 5
+                for idx in range(NUM_ADDRESSES):
                     try:
                         child_key = root_key \
                             .ChildKey(44 + 0x80000000) \
@@ -312,7 +311,6 @@ class WalletScanner:
         errors = 0
         while not self._shutdown:
             try:
-                # Generate mnemonic
                 mnemonic = self.generate_mnemonic()
                 if not mnemonic:
                     errors += 1
@@ -321,13 +319,12 @@ class WalletScanner:
                         errors = 0
                     continue
 
-                # Check cache
                 cached, _ = self.seen_cache.get(mnemonic)
                 if cached:
                     continue
                 self.seen_cache.set(mnemonic, True)
 
-                # Derive addresses with timeout
+                # Derive with timeout
                 try:
                     addresses = await asyncio.wait_for(
                         self.derive_addresses(mnemonic),
@@ -344,13 +341,11 @@ class WalletScanner:
                         errors = 0
                     continue
 
-                # Check balances
                 balances = await self.get_balances(addresses)
                 total = sum(balances.values())
                 self.stats['checked'] += 1
                 errors = 0
 
-                # Check if funded
                 funded = total > ALERT_MIN_BALANCE
                 if funded:
                     self.wallet_counter += 1
@@ -360,7 +355,6 @@ class WalletScanner:
                     await self.alert_mgr.send_alert(mnemonic, balances, total, wallet_id)
                     self.stats['alerts'] += 1
 
-                # Log progress every 10 checks
                 if self.stats['checked'] % 10 == 0:
                     rate = self.stats['funded'] / max(self.stats['checked'], 1) * 1e6
                     elapsed = time.time() - self.stats['start_time']
