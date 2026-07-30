@@ -32,26 +32,17 @@ ALERT_MAX_PER_HOUR = int(os.environ.get("ALERT_MAX_PER_HOUR", "5"))
 
 MAX_WORKERS = max(1, int(os.environ.get("MAX_WORKERS", "3")))
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "300"))
-NUM_ADDRESSES = int(os.environ.get("NUM_ADDRESSES", "5"))   # Faster
+NUM_ADDRESSES = int(os.environ.get("NUM_ADDRESSES", "5"))
 
+# ----- API Keys (used only as fallback for Etherscan) -----
 def parse_keys(env_var: str) -> List[str]:
-    """Split comma-separated keys, strip whitespace, ignore empty."""
     return [k.strip() for k in env_var.split(",") if k.strip()]
 
-# ----- API Keys – support both ETHERSCAN_KEYS and ETHERSCAN_KEY -----
-if BLOCKCHAIN == "ethereum":
-    keys_from_old = parse_keys(os.environ.get("ETHERSCAN_KEY", ""))
-    ETHERSCAN_KEYS = parse_keys(os.environ.get("ETHERSCAN_KEYS", "")) or keys_from_old
-    if not ETHERSCAN_KEYS:
-        logging.warning("No Etherscan API keys provided.")
-    else:
-        logging.info(f"Loaded {len(ETHERSCAN_KEYS)} Etherscan API keys")
-elif BLOCKCHAIN == "bsc":
-    keys_from_old = parse_keys(os.environ.get("BSCSCAN_KEY", ""))
-    BSCSCAN_KEYS = parse_keys(os.environ.get("BSCSCAN_KEYS", "")) or keys_from_old
-    if not BSCSCAN_KEYS:
-        logging.warning("No BscScan API keys provided.")
+ETHERSCAN_KEYS = parse_keys(os.environ.get("ETHERSCAN_KEYS", "")) or parse_keys(os.environ.get("ETHERSCAN_KEY", ""))
+if ETHERSCAN_KEYS:
+    logging.info(f"Loaded {len(ETHERSCAN_KEYS)} Etherscan API keys (fallback)")
 
+# Logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -85,7 +76,7 @@ class LRUCache:
             if now - self.cache[k][1] > ttl:
                 del self.cache[k]
 
-# ---------- Key Rotator ----------
+# ---------- Key Rotator (for Etherscan fallback) ----------
 class KeyRotator:
     def __init__(self, keys: List[str]):
         self.keys = keys
@@ -188,12 +179,8 @@ class WalletScanner:
         self._shutdown = False
         self.wallet_counter = 0
 
-        if BLOCKCHAIN == "ethereum":
-            self.key_rotator = KeyRotator(ETHERSCAN_KEYS if 'ETHERSCAN_KEYS' in globals() else [])
-        elif BLOCKCHAIN == "bsc":
-            self.key_rotator = KeyRotator(BSCSCAN_KEYS if 'BSCSCAN_KEYS' in globals() else [])
-        else:
-            self.key_rotator = None
+        # Fallback key rotator for Etherscan (if blockchain.com fails)
+        self.etherscan_rotator = KeyRotator(ETHERSCAN_KEYS) if ETHERSCAN_KEYS else None
 
     def generate_mnemonic(self):
         try:
@@ -263,8 +250,8 @@ class WalletScanner:
                         if BLOCKCHAIN == "bitcoin":
                             bal = await self._btc_balance(addr)
                         else:
-                            key = await self.key_rotator.get_key() if self.key_rotator else ""
-                            bal = await self._evm_balance(addr, key)
+                            # Try blockchain.com first, fallback to Etherscan
+                            bal = await self._evm_balance(addr)
                         self.balance_cache.set(addr, bal, time.time())
                         return addr, bal
                     except Exception as e:
@@ -276,23 +263,42 @@ class WalletScanner:
                 balances[addr] = bal
         return balances
 
-    async def _btc_balance(self, addr):
+    # ----- New: blockchain.com balance check -----
+    async def _blockchain_com_balance(self, address: str) -> Optional[float]:
+        """Try blockchain.com API first."""
+        url = f"https://api.blockchain.info/v2/eth/address/{address}/balance"
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(f"https://mempool.space/api/address/{addr}", timeout=10) as resp:
+                async with session.get(url, timeout=10) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        return data.get('chain_stats', {}).get('funded_txo_sum', 0) / 1e8
-        except:
-            pass
-        return 0.0
+                        if 'balance' in data:
+                            return data['balance'] / 1e18
+                    elif resp.status == 429:
+                        # Rate limited – wait a bit and retry once
+                        await asyncio.sleep(2)
+                        async with session.get(url, timeout=10) as retry_resp:
+                            if retry_resp.status == 200:
+                                data = await retry_resp.json()
+                                if 'balance' in data:
+                                    return data['balance'] / 1e18
+        except Exception as e:
+            logger.debug(f"blockchain.com error for {address}: {e}")
+        return None
 
-    async def _evm_balance(self, addr, key):
-        base = "https://api.etherscan.io/api" if BLOCKCHAIN == "ethereum" else "https://api.bscscan.com/api"
+    # ----- Fallback: Etherscan -----
+    async def _etherscan_balance(self, address: str) -> Optional[float]:
+        """Fallback to Etherscan (requires API key)."""
+        if not self.etherscan_rotator:
+            return None
+        key = await self.etherscan_rotator.get_key()
+        if not key:
+            return None
+        base = "https://api.etherscan.io/api"
         params = {
             "module": "account",
             "action": "balance",
-            "address": addr,
+            "address": address,
             "tag": "latest",
             "apikey": key
         }
@@ -303,8 +309,41 @@ class WalletScanner:
                         data = await resp.json()
                         if data.get('status') == '1':
                             return int(data['result']) / 1e18
+                    elif resp.status == 429:
+                        # Rate limited – wait and retry once
+                        await asyncio.sleep(2)
+                        async with session.get(base, params=params, timeout=10) as retry_resp:
+                            if retry_resp.status == 200:
+                                data = await retry_resp.json()
+                                if data.get('status') == '1':
+                                    return int(data['result']) / 1e18
         except Exception as e:
-            logger.debug(f"EVM balance error for {addr}: {e}")
+            logger.debug(f"Etherscan error for {address}: {e}")
+        return None
+
+    async def _evm_balance(self, address: str) -> float:
+        """Try blockchain.com, fallback to Etherscan."""
+        # First try blockchain.com
+        bal = await self._blockchain_com_balance(address)
+        if bal is not None:
+            return bal
+        # Fallback to Etherscan
+        bal = await self._etherscan_balance(address)
+        if bal is not None:
+            return bal
+        # If both fail, return 0
+        return 0.0
+
+    # Bitcoin uses mempool.space (unchanged)
+    async def _btc_balance(self, addr):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"https://mempool.space/api/address/{addr}", timeout=10) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get('chain_stats', {}).get('funded_txo_sum', 0) / 1e8
+        except:
+            pass
         return 0.0
 
     async def scan_loop(self):
@@ -324,7 +363,6 @@ class WalletScanner:
                     continue
                 self.seen_cache.set(mnemonic, True)
 
-                # Derive with timeout
                 try:
                     addresses = await asyncio.wait_for(
                         self.derive_addresses(mnemonic),
@@ -404,11 +442,11 @@ async def main():
 
     scanner = WalletScanner()
     logger.info(f"🚀 Starting {BLOCKCHAIN.upper()} scanner with Discord alerts")
-    if scanner.key_rotator:
-        logger.info(f"🔑 Loaded {len(scanner.key_rotator.keys)} API keys for rotation")
-    else:
-        logger.info("ℹ️  No API keys loaded (Bitcoin mode or keys missing)")
     logger.info(f"📊 Workers:{MAX_WORKERS} | Min Balance:{ALERT_MIN_BALANCE} | Addresses per wallet:{NUM_ADDRESSES}")
+    if scanner.etherscan_rotator:
+        logger.info(f"🔑 Loaded {len(scanner.etherscan_rotator.keys)} Etherscan keys as fallback")
+    else:
+        logger.info("ℹ️  No Etherscan keys provided – will only use blockchain.com")
 
     # Startup test
     logger.info("🧪 Running startup test...")
@@ -419,6 +457,15 @@ async def main():
         logger.info(f"✅ Derived {len(test_addresses)} addresses")
     else:
         logger.error("❌ Failed to generate test mnemonic!")
+
+    # Test blockchain.com API
+    test_addr = "0x0000000000000000000000000000000000000000"
+    bal = await scanner._blockchain_com_balance(test_addr)
+    if bal is not None:
+        logger.info(f"✅ blockchain.com API works (balance of null address: {bal:.18f} ETH)")
+    else:
+        logger.warning("⚠️  blockchain.com API failed – will use Etherscan fallback if available")
+
     logger.info("🧪 Startup test complete – starting main loop")
 
     await scanner.alert_mgr.start()
