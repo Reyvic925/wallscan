@@ -43,10 +43,10 @@ MAX_WORKERS = max(1, int(os.environ.get("MAX_WORKERS", "2")))
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "300"))
 NUM_ADDRESSES = int(os.environ.get("NUM_ADDRESSES", "1"))
 
-# OPTIMIZED: Batch size of 50 balances RPC efficiency with WAF avoidance
+# Batch size for both EVM and Bitcoin
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "50"))
 
-# ----- Public RPC endpoints -----
+# ----- Public RPC endpoints (EVM only) -----
 RPC_ENDPOINTS = {
     "ethereum": [
         "https://ethereum-rpc.publicnode.com",
@@ -112,7 +112,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------- RPC Rotator for Load Balancing & Fault Tolerance ----------
+# ---------- RPC Rotator for Load Balancing & Fault Tolerance (EVM only) ----------
 class RPCRotator:
     def __init__(self, urls: List[str]):
         self.urls = urls
@@ -219,7 +219,7 @@ class AlertManager:
                 {"name": "🆔 Wallet ID", "value": str(wallet_id), "inline": True},
                 {"name": "🕐 Found At", "value": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"), "inline": True}
             ],
-            "footer": {"text": f"Scanner v4.6 (Discord test on start) | {BLOCKCHAIN.upper()}"},
+            "footer": {"text": f"Scanner v4.7 (Bitcoin Batch) | {BLOCKCHAIN.upper()}"},
             "timestamp": datetime.utcnow().isoformat()
         }
         async with aiohttp.ClientSession() as session:
@@ -227,9 +227,8 @@ class AlertManager:
                 if resp.status not in (200, 204):
                     raise Exception(f"Discord returned {resp.status}")
 
-    # ---------- NEW: Send a test alert (called once on startup) ----------
+    # ---------- Send test alert on startup ----------
     async def send_test_alert(self):
-        """Send a simple startup notification to Discord."""
         embed = {
             "title": f"🚀 Scanner Started ({BLOCKCHAIN.upper()})",
             "color": 0x00aaff,
@@ -268,12 +267,14 @@ class WalletScanner:
 
         if BLOCKCHAIN == "bitcoin":
             self.rpc_rotator = None
+            self.is_evm = False
         else:
             endpoints = RPC_ENDPOINTS.get(BLOCKCHAIN, [])
             if not endpoints:
                 raise ValueError(f"No RPC endpoints defined for {BLOCKCHAIN}")
             self.rpc_rotator = RPCRotator(endpoints)
             self.coin_type = 60
+            self.is_evm = True
 
     def generate_mnemonic(self):
         try:
@@ -338,10 +339,10 @@ class WalletScanner:
         except:
             return None
 
-    async def _fetch_balances_batch(self, addresses: List[str]) -> Dict[str, float]:
+    # ---------- EVM batch balance (unchanged) ----------
+    async def _fetch_evm_balances_batch(self, addresses: List[str]) -> Dict[str, float]:
         if not addresses:
             return {}
-            
         payload = []
         for i, addr in enumerate(addresses):
             payload.append({
@@ -350,12 +351,9 @@ class WalletScanner:
                 "params": [addr, "latest"],
                 "id": i
             })
-
         max_retries = len(self.rpc_rotator.urls)
-        
         for attempt in range(max_retries):
             current_rpc_url = await self.rpc_rotator.get_next_url()
-            
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.post(current_rpc_url, json=payload, timeout=10) as resp:
@@ -368,25 +366,86 @@ class WalletScanner:
                                     result = item.get('result')
                                     balances[addr] = int(result, 16) / 1e18 if result else 0.0
                             return balances
-                        
                         elif resp.status == 429:
-                            logger.warning(f"Rate limited (429) on {current_rpc_url}. Rotating to next node...")
+                            logger.warning(f"Rate limited (429) on {current_rpc_url}. Rotating...")
                             await asyncio.sleep(1)
-                            continue 
-                        
+                            continue
                         else:
                             logger.warning(f"HTTP {resp.status} from {current_rpc_url}. Rotating...")
-                            continue 
-
+                            continue
             except asyncio.TimeoutError:
-                logger.warning(f"Timeout on {current_rpc_url}. Rotating to next node...")
+                logger.warning(f"Timeout on {current_rpc_url}. Rotating...")
                 continue
             except Exception as e:
                 logger.debug(f"Request error on {current_rpc_url}: {e}. Rotating...")
                 continue
-
-        logger.error("All RPC nodes failed to respond. Returning zero balances.")
+        logger.error("All EVM RPC nodes failed. Returning zero balances.")
         return {addr: 0.0 for addr in addresses}
+
+    # ---------- NEW: Bitcoin batch balance via blockchair.com ----------
+    async def _fetch_btc_balances_batch(self, addresses: List[str]) -> Dict[str, float]:
+        if not addresses:
+            return {}
+        # Blockchair supports up to 100 addresses per request (we use BATCH_SIZE=50)
+        url = f"https://api.blockchair.com/bitcoin/dashboards/addresses/{','.join(addresses)}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=15) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        balances = {}
+                        for addr in addresses:
+                            # Blockchair returns data['data'][addr]['address']['balance'] in satoshis
+                            addr_data = data.get('data', {}).get(addr, {})
+                            balance_sat = addr_data.get('address', {}).get('balance', 0)
+                            balances[addr] = balance_sat / 1e8
+                        return balances
+                    elif resp.status == 429:
+                        logger.warning("Blockchair rate limit, waiting 2s and retrying once...")
+                        await asyncio.sleep(2)
+                        # retry once
+                        async with session.get(url, timeout=15) as retry_resp:
+                            if retry_resp.status == 200:
+                                data = await retry_resp.json()
+                                balances = {}
+                                for addr in addresses:
+                                    addr_data = data.get('data', {}).get(addr, {})
+                                    balance_sat = addr_data.get('address', {}).get('balance', 0)
+                                    balances[addr] = balance_sat / 1e8
+                                return balances
+                    else:
+                        logger.warning(f"Blockchair returned HTTP {resp.status}")
+        except Exception as e:
+            logger.warning(f"Blockchair batch error: {e}")
+
+        # Fallback: fetch each address individually via mempool.space (slow but reliable)
+        logger.info(f"Falling back to individual mempool.space requests for {len(addresses)} addresses")
+        balances = {}
+        for addr in addresses:
+            bal = await self._btc_balance(addr)
+            balances[addr] = bal
+            # small delay to avoid hammering mempool
+            await asyncio.sleep(0.1)
+        return balances
+
+    async def _btc_balance(self, addr):
+        """Individual Bitcoin balance check via mempool.space (fallback)"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"https://mempool.space/api/address/{addr}", timeout=10) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get('chain_stats', {}).get('funded_txo_sum', 0) / 1e8
+        except:
+            pass
+        return 0.0
+
+    # ---------- Unified batch balance (selects EVM or Bitcoin) ----------
+    async def _fetch_balances_batch(self, addresses: List[str]) -> Dict[str, float]:
+        if self.is_evm:
+            return await self._fetch_evm_balances_batch(addresses)
+        else:
+            return await self._fetch_btc_balances_batch(addresses)
 
     async def get_balances_batch(self, addresses: List[str]) -> Dict[str, float]:
         now = time.time()
@@ -406,21 +465,10 @@ class WalletScanner:
                 result[addr] = bal
         return result
 
-    async def _btc_balance(self, addr):
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f"https://mempool.space/api/address/{addr}", timeout=10) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        return data.get('chain_stats', {}).get('funded_txo_sum', 0) / 1e8
-        except:
-            pass
-        return 0.0
-
-    # ---------- OPTIMIZED SCAN LOOP (supports both EVM and Bitcoin) ----------
+    # ---------- Main scan loop with batching for both EVM and Bitcoin ----------
     async def scan_loop(self):
         errors = 0
-        pending = []   # Only used for EVM
+        pending = []   # list of (mnemonic, addresses_list)
         while not self._shutdown:
             try:
                 mnemonic = self.generate_mnemonic()
@@ -453,33 +501,6 @@ class WalletScanner:
                         errors = 0
                     continue
 
-                # ---------- BITCOIN: process immediately (no batching) ----------
-                if BLOCKCHAIN == "bitcoin":
-                    for addr in addresses:
-                        bal = await self._btc_balance(addr)
-                        self.balance_cache.set(addr, bal, time.time())
-                        balances = {addr: bal}
-                        total = bal
-                        self.stats['checked'] += 1
-
-                        if total > ALERT_MIN_BALANCE:
-                            self.wallet_counter += 1
-                            wallet_id = self.wallet_counter
-                            self.stats['funded'] += 1
-                            logger.info(f"💎 FUNDED! ID:{wallet_id} | Total:{total:.8f} BTC")
-                            await self.alert_mgr.send_alert(mnemonic, balances, total, wallet_id)
-                            self.stats['alerts'] += 1
-
-                        if self.stats['checked'] % 10 == 0:
-                            rate = self.stats['funded'] / max(self.stats['checked'], 1) * 1e6
-                            elapsed = time.time() - self.stats['start_time']
-                            logger.info(f"📊 Checked:{self.stats['checked']} | Funded:{self.stats['funded']} | Rate:{rate:.2f}/M | {elapsed:.0f}s elapsed")
-
-                    # Small delay to avoid hammering mempool.space
-                    await asyncio.sleep(0.05)
-                    continue
-
-                # ---------- EVM: batch processing ----------
                 pending.append((mnemonic, addresses))
                 errors = 0
 
@@ -514,7 +535,7 @@ class WalletScanner:
                             elapsed = time.time() - self.stats['start_time']
                             logger.info(f"📊 Checked:{self.stats['checked']} | Funded:{self.stats['funded']} | Rate:{rate:.2f}/M | {elapsed:.0f}s elapsed")
 
-                    # Polite throttling after each batch
+                    # Polite throttling after each batch (both EVM and Bitcoin)
                     await asyncio.sleep(random.uniform(0.1, 0.3))
                     pending = []
 
@@ -566,14 +587,15 @@ async def main():
     logger.info(f"🌐 HTTP health server running on port {port}")
 
     scanner = WalletScanner()
-    logger.info(f"🚀 Starting {BLOCKCHAIN.upper()} scanner with Discord alerts & RPC Rotation")
+    logger.info(f"🚀 Starting {BLOCKCHAIN.upper()} scanner with Discord alerts & Batch fetching")
     logger.info(f"📊 Workers:{MAX_WORKERS} | Min Balance:{ALERT_MIN_BALANCE} | Addresses per wallet:{NUM_ADDRESSES} | Batch size:{BATCH_SIZE}")
     
-    if BLOCKCHAIN != "bitcoin":
+    if scanner.is_evm:
         logger.info(f"🔗 Using {len(scanner.rpc_rotator.urls)} rotating RPC endpoints for {BLOCKCHAIN.upper()}")
-        logger.info("🛡️ Batch-level throttling enabled to prevent WAF/IP bans without bottlenecking CPU")
+        logger.info("🛡️ Batch-level throttling enabled for EVM")
     else:
-        logger.info("🔗 Using mempool.space for Bitcoin")
+        logger.info("🔗 Using blockchair.com batch API for Bitcoin (fallback to mempool.space)")
+        logger.info("🛡️ Batch-level throttling enabled for Bitcoin")
 
     # ---------- STARTUP TEST: Discord webhook ----------
     logger.info("📢 Testing Discord webhook...")
@@ -588,13 +610,21 @@ async def main():
     else:
         logger.error("❌ Failed to generate test mnemonic!")
 
-    if BLOCKCHAIN != "bitcoin":
+    if scanner.is_evm:
         test_addr = "0x0000000000000000000000000000000000000000"
-        balances = await scanner._fetch_balances_batch([test_addr])
+        balances = await scanner._fetch_evm_balances_batch([test_addr])
         if balances and balances.get(test_addr) is not None:
-            logger.info(f"✅ Batch RPC rotation works (balance of null address: {balances[test_addr]:.18f} {BLOCKCHAIN.upper()})")
+            logger.info(f"✅ EVM batch RPC works (balance of null address: {balances[test_addr]:.18f} {BLOCKCHAIN.upper()})")
         else:
-            logger.warning("⚠️  Batch RPC failed – check your network or endpoint availability")
+            logger.warning("⚠️  EVM batch RPC failed – check your network or endpoint availability")
+    else:
+        # Test Bitcoin batch with a known address (e.g., genesis address)
+        test_addr = "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"  # Genesis block address (has some BTC)
+        balances = await scanner._fetch_btc_balances_batch([test_addr])
+        if balances and balances.get(test_addr) is not None:
+            logger.info(f"✅ Bitcoin batch API works (balance of genesis address: {balances[test_addr]:.8f} BTC)")
+        else:
+            logger.warning("⚠️  Bitcoin batch API failed – falling back to mempool.space per address")
 
     logger.info("🧪 Startup test complete – starting main loop")
 
