@@ -7,309 +7,572 @@ import json
 import hashlib
 import base58
 import secrets
+import sqlite3
 import threading
+import psutil
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
+from collections import OrderedDict
+from contextlib import contextmanager
 
 from mnemonic import Mnemonic
-from bip32utils import BIP32Key
+from bip32 import BIP32
 from eth_keys import keys as EthKeys
 from bech32 import bech32_encode, convertbits
 
-# ---------- Configuration from environment ----------
-BLOCKCHAIN = os.environ.get("BLOCKCHAIN", "ethereum")        # "bitcoin", "ethereum", "bsc"
-DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
-MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "5"))        # lower to avoid rate limits
-MIN_BALANCE = float(os.environ.get("MIN_BALANCE", "0.001"))  # minimum balance to alert
-CACHE_TTL = int(os.environ.get("CACHE_TTL", "300"))          # seconds to cache balance
+# ---------- Configuration ----------
+BLOCKCHAIN = os.environ.get("BLOCKCHAIN", "ethereum").lower()
+if BLOCKCHAIN not in ["bitcoin", "ethereum", "bsc"]:
+    raise ValueError("BLOCKCHAIN must be 'bitcoin', 'ethereum', or 'bsc'")
 
-# API keys (optional, free)
+# Discord alert (required)
+DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
+if not DISCORD_WEBHOOK:
+    raise ValueError("DISCORD_WEBHOOK environment variable is required")
+if not DISCORD_WEBHOOK.startswith("https://discord.com/api/webhooks/"):
+    raise ValueError("Invalid DISCORD_WEBHOOK URL")
+
+# Alert settings
+ALERT_MIN_BALANCE = float(os.environ.get("ALERT_MIN_BALANCE", "0.001"))
+ALERT_COOLDOWN = int(os.environ.get("ALERT_COOLDOWN", "300"))      # seconds
+ALERT_MAX_PER_HOUR = int(os.environ.get("ALERT_MAX_PER_HOUR", "5"))
+
+# Performance
+MAX_WORKERS = max(1, int(os.environ.get("MAX_WORKERS", "3")))
+CACHE_TTL = int(os.environ.get("CACHE_TTL", "300"))
+
+# API Keys
 ETHERSCAN_KEY = os.environ.get("ETHERSCAN_KEY", "")
 BSCSCAN_KEY = os.environ.get("BSCSCAN_KEY", "")
+if BLOCKCHAIN in ["ethereum", "bsc"] and not (ETHERSCAN_KEY if BLOCKCHAIN == "ethereum" else BSCSCAN_KEY):
+    logging.warning(f"No API key provided for {BLOCKCHAIN}. Rate limits will be strict.")
+
+# Database
+DATABASE_PATH = os.environ.get("DATABASE_PATH", "wallet_scanner.db")
+MONITORING_INTERVAL = int(os.environ.get("MONITORING_INTERVAL", "300"))
 
 # Logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.FileHandler('scanner.log'), logging.StreamHandler()]
+)
 logger = logging.getLogger(__name__)
 
-# ---------- API Endpoints ----------
-BTC_ENDPOINTS = [
-    ("mempool", "https://mempool.space/api"),
-    ("blockstream", "https://blockstream.info/api"),
-    ("blockchain", "https://blockchain.info"),
-    ("btc_com", "https://chain.api.btc.com/v3"),
-]
+# ---------- Database ----------
+class DatabaseManager:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._init_db()
 
-ETH_ENDPOINTS = [
-    ("etherscan", "https://api.etherscan.io/api"),
-    ("blockscout", "https://eth.blockscout.com/api/v1"),
-    ("cloudflare", "https://cloudflare-eth.com"),
-    ("llama", "https://eth.llamarpc.com"),
-    ("publicnode", "https://ethereum.publicnode.com"),
-]
+    @contextmanager
+    def get_connection(self):
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=30)
+            conn.row_factory = sqlite3.Row
+            yield conn
+            conn.commit()
+        except sqlite3.Error as e:
+            if conn:
+                conn.rollback()
+            logger.error(f"Database error: {e}")
+            raise
+        finally:
+            if conn:
+                conn.close()
 
-BSC_ENDPOINTS = [
-    ("bscscan", "https://api.bscscan.com/api"),
-    ("blockscout_bsc", "https://bsc.blockscout.com/api/v1"),
-    ("binance_rpc", "https://bsc-dataseed.binance.org/"),
-    ("binance_rpc2", "https://bsc-dataseed1.binance.org/"),
-]
+    def _init_db(self):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS wallets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    mnemonic TEXT UNIQUE NOT NULL,
+                    blockchain TEXT NOT NULL,
+                    total_balance REAL DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    check_count INTEGER DEFAULT 1,
+                    is_funded BOOLEAN DEFAULT 0,
+                    last_alerted TIMESTAMP,
+                    alert_count INTEGER DEFAULT 0
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS addresses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    wallet_id INTEGER NOT NULL,
+                    address TEXT NOT NULL,
+                    balance REAL DEFAULT 0,
+                    last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (wallet_id) REFERENCES wallets(id) ON DELETE CASCADE,
+                    UNIQUE(wallet_id, address)
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS alerts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    wallet_id INTEGER NOT NULL,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    success BOOLEAN DEFAULT 1,
+                    error_message TEXT
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS metrics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    total_checked INTEGER DEFAULT 0,
+                    total_funded INTEGER DEFAULT 0,
+                    total_alerts_sent INTEGER DEFAULT 0,
+                    scan_rate REAL DEFAULT 0,
+                    error_rate REAL DEFAULT 0,
+                    memory_usage_mb REAL DEFAULT 0,
+                    cpu_percent REAL DEFAULT 0
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS errors (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    error_type TEXT NOT NULL,
+                    error_message TEXT,
+                    stack_trace TEXT,
+                    context TEXT
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_wallets_funded ON wallets(is_funded)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_wallets_last_alerted ON wallets(last_alerted)")
 
-# ---------- API Rotator ----------
-class APIRotator:
-    def __init__(self, endpoints: List[Tuple[str, str]], failure_cooldown: int = 60):
-        self.endpoints = endpoints
-        self.failure_cooldown = failure_cooldown
-        self.failures = {}  # name -> last_fail_time
+    def save_wallet(self, mnemonic: str, balances: Dict[str, float], total: float, is_funded: bool):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO wallets (mnemonic, blockchain, total_balance, last_checked, check_count, is_funded)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP, 1, ?)
+                ON CONFLICT(mnemonic) DO UPDATE SET
+                    total_balance = excluded.total_balance,
+                    last_checked = CURRENT_TIMESTAMP,
+                    check_count = check_count + 1,
+                    is_funded = excluded.is_funded
+            """, (mnemonic, BLOCKCHAIN, total, 1 if is_funded else 0))
+            wallet_id = cursor.lastrowid
+            if not wallet_id:
+                cursor.execute("SELECT id FROM wallets WHERE mnemonic = ?", (mnemonic,))
+                row = cursor.fetchone()
+                wallet_id = row['id'] if row else None
+            if wallet_id:
+                for address, balance in balances.items():
+                    cursor.execute("""
+                        INSERT INTO addresses (wallet_id, address, balance, last_checked)
+                        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT(wallet_id, address) DO UPDATE SET
+                            balance = excluded.balance,
+                            last_checked = CURRENT_TIMESTAMP
+                    """, (wallet_id, address, balance))
+            return wallet_id
 
-    async def get(self, path: str, params: Optional[dict] = None, json_payload: Optional[dict] = None) -> Optional[dict]:
-        """
-        Try each endpoint in order. Return JSON response on success, else None.
-        """
-        for name, base in self.endpoints:
-            # skip if in cooldown
-            if name in self.failures:
-                if time.time() - self.failures[name] < self.failure_cooldown:
-                    continue
-                else:
-                    del self.failures[name]
+    def update_alert_record(self, wallet_id: int, success: bool, error_msg: str = ""):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO alerts (wallet_id, success, error_message)
+                VALUES (?, ?, ?)
+            """, (wallet_id, success, error_msg))
+            if success:
+                cursor.execute("""
+                    UPDATE wallets SET last_alerted = CURRENT_TIMESTAMP, alert_count = alert_count + 1
+                    WHERE id = ?
+                """, (wallet_id,))
 
-            url = base + path
+    def should_alert_wallet(self, wallet_id: int) -> bool:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT last_alerted FROM wallets WHERE id = ?", (wallet_id,))
+            row = cursor.fetchone()
+            if row and row['last_alerted']:
+                last_alert = datetime.fromisoformat(row['last_alerted'])
+                if (datetime.now() - last_alert).seconds < ALERT_COOLDOWN:
+                    return False
+            return True
+
+    def get_recent_alerts(self, limit: int = 5):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT w.mnemonic, w.total_balance, a.timestamp
+                FROM alerts a JOIN wallets w ON a.wallet_id = w.id
+                WHERE a.success = 1
+                ORDER BY a.timestamp DESC LIMIT ?
+            """, (limit,))
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_alert_count_last_hour(self):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT COUNT(*) as count FROM alerts
+                WHERE timestamp > datetime('now', '-1 hour')
+            """)
+            row = cursor.fetchone()
+            return row['count'] if row else 0
+
+    def log_error(self, error_type: str, message: str, stack: str = "", context: str = ""):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO errors (error_type, error_message, stack_trace, context)
+                VALUES (?, ?, ?, ?)
+            """, (error_type, message, stack, context))
+
+# ---------- Alert Manager (Discord only) ----------
+class AlertManager:
+    def __init__(self, db: DatabaseManager):
+        self.db = db
+        self.queue = asyncio.Queue()
+        self.running = True
+        self.rate_limit = []   # timestamps of sent alerts in last hour
+
+    async def start(self):
+        asyncio.create_task(self._worker())
+
+    async def stop(self):
+        self.running = False
+
+    def _check_rate_limit(self) -> bool:
+        now = time.time()
+        self.rate_limit = [t for t in self.rate_limit if now - t < 3600]
+        if len(self.rate_limit) >= ALERT_MAX_PER_HOUR:
+            return False
+        self.rate_limit.append(now)
+        return True
+
+    async def send_alert(self, mnemonic: str, balances: Dict[str, float], total: float, wallet_id: int):
+        await self.queue.put((mnemonic, balances, total, wallet_id))
+
+    async def _worker(self):
+        while self.running:
             try:
-                async with aiohttp.ClientSession() as session:
-                    if json_payload is not None:
-                        async with session.post(url, json=json_payload, timeout=10) as resp:
-                            if resp.status == 200:
-                                return await resp.json()
-                    else:
-                        async with session.get(url, params=params, timeout=10) as resp:
-                            if resp.status == 200:
-                                data = await resp.json()
-                                # Check for error responses (e.g., Etherscan status=0)
-                                if isinstance(data, dict) and data.get('status') == '0':
+                mnemonic, balances, total, wallet_id = await asyncio.wait_for(self.queue.get(), timeout=1)
+                if not self.db.should_alert_wallet(wallet_id):
+                    self.queue.task_done()
+                    continue
+                if not self._check_rate_limit():
+                    logger.warning("Alert rate limit reached, skipping")
+                    self.queue.task_done()
+                    continue
+                # Send Discord
+                try:
+                    await self._send_discord(mnemonic, balances, total, wallet_id)
+                    self.db.update_alert_record(wallet_id, True)
+                except Exception as e:
+                    logger.error(f"Discord alert failed: {e}")
+                    self.db.update_alert_record(wallet_id, False, str(e))
+                self.queue.task_done()
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                logger.error(f"Alert worker error: {e}")
+                await asyncio.sleep(1)
+
+    async def _send_discord(self, mnemonic: str, balances: Dict[str, float], total: float, wallet_id: int):
+        funded = {k: v for k, v in balances.items() if v > 0}
+        recent = self.db.get_recent_alerts(5)
+        recent_text = "\n".join([
+            f"• {w['mnemonic'][:20]}... ({w['total_balance']:.8f} {BLOCKCHAIN.upper()})"
+            for w in recent
+        ]) if recent else "None"
+
+        embed = {
+            "title": f"💰 FUNDED WALLET FOUND! ({BLOCKCHAIN.upper()})",
+            "color": 0x00ff00,
+            "fields": [
+                {"name": "🔑 Mnemonic", "value": f"`{mnemonic}`", "inline": False},
+                {"name": "💰 Total Balance", "value": f"{total:.8f} {BLOCKCHAIN.upper()}", "inline": True},
+                {"name": "🪙 Addresses with Balance",
+                 "value": "\n".join([f"`{addr}`: {bal:.8f}" for addr, bal in list(funded.items())[:10]]),
+                 "inline": False},
+                {"name": "📊 Recent Alerts", "value": recent_text, "inline": False},
+                {"name": "🆔 Wallet ID", "value": str(wallet_id), "inline": True},
+                {"name": "🕐 Found At", "value": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"), "inline": True}
+            ],
+            "footer": {"text": f"Scanner v2.0 | {BLOCKCHAIN.upper()}"},
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=10) as resp:
+                if resp.status not in (200, 204):
+                    raise Exception(f"Discord returned {resp.status}")
+
+# ---------- LRU Cache ----------
+class LRUCache:
+    def __init__(self, max_size=10000):
+        self.cache = OrderedDict()
+        self.max_size = max_size
+
+    def get(self, key):
+        if key in self.cache:
+            value, ts = self.cache[key]
+            self.cache.move_to_end(key)
+            return value, ts
+        return None, None
+
+    def set(self, key, value, ts=None):
+        if key in self.cache:
+            self.cache.move_to_end(key)
+        self.cache[key] = (value, ts or time.time())
+        if len(self.cache) > self.max_size:
+            self.cache.popitem(last=False)
+
+    def clear_expired(self, ttl):
+        now = time.time()
+        for k in list(self.cache.keys()):
+            if now - self.cache[k][1] > ttl:
+                del self.cache[k]
+
+# ---------- API rotator (simplified) ----------
+class APIRotator:
+    def __init__(self, endpoints, cooldown=60):
+        self.endpoints = endpoints
+        self.cooldown = cooldown
+        self.failures = {}
+
+    async def get(self, path, params=None, json_payload=None):
+        for name, base in self.endpoints:
+            if name in self.failures and time.time() - self.failures[name] < self.cooldown:
+                continue
+            url = base + path
+            for attempt in range(3):
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        if json_payload:
+                            async with session.post(url, json=json_payload, timeout=15) as resp:
+                                if resp.status == 200:
+                                    return await resp.json()
+                                elif resp.status == 429:
+                                    await asyncio.sleep(2 ** attempt)
                                     continue
-                                return data
+                        else:
+                            async with session.get(url, params=params, timeout=15) as resp:
+                                if resp.status == 200:
+                                    data = await resp.json()
+                                    if isinstance(data, dict) and data.get('status') == '0':
+                                        continue
+                                    return data
+                                elif resp.status == 429:
+                                    await asyncio.sleep(2 ** attempt)
+                                    continue
+                        self.failures[name] = time.time()
+                except Exception:
                     self.failures[name] = time.time()
-            except Exception:
-                self.failures[name] = time.time()
         return None
 
-# ---------- Balance checking functions ----------
-async def get_btc_balance(address: str) -> float:
-    """Try multiple BTC APIs, return balance in BTC."""
-    rotator = APIRotator(BTC_ENDPOINTS)
-    for name, base in BTC_ENDPOINTS:
-        if name in ("mempool", "blockstream"):
-            data = await rotator.get(f"/address/{address}")
-            if data:
-                return data.get('chain_stats', {}).get('funded_txo_sum', 0) / 1e8
-        elif name == "blockchain":
-            data = await rotator.get(f"/rawaddr/{address}")
-            if data:
-                return data.get('final_balance', 0) / 1e8
-        elif name == "btc_com":
-            data = await rotator.get(f"/address/{address}")
-            if data and data.get('data'):
-                return data['data'].get('balance', 0) / 1e8
-    return 0.0
-
-async def get_evm_balance(address: str, blockchain: str, api_key: str = "") -> float:
-    """Try multiple EVM endpoints, return native balance (ETH/BNB)."""
-    if blockchain == "ethereum":
-        endpoints = ETH_ENDPOINTS
-        symbol = "ETH"
-    else:
-        endpoints = BSC_ENDPOINTS
-        symbol = "BNB"
-
-    rotator = APIRotator(endpoints)
-    for name, base in endpoints:
-        if name in ("etherscan", "bscscan"):
-            params = {
-                "module": "account",
-                "action": "balance",
-                "address": address,
-                "tag": "latest",
-                "apikey": api_key
-            }
-            data = await rotator.get("", params=params)
-            if data and data.get('status') == '1':
-                return int(data['result']) / 1e18
-        elif name in ("blockscout", "blockscout_bsc"):
-            data = await rotator.get(f"/addresses/{address}/balances")
-            if data and isinstance(data, list):
-                for item in data:
-                    if item.get('token', {}).get('symbol') == symbol:
-                        return float(item.get('value', 0)) / 1e18
-        elif name in ("cloudflare", "llama", "publicnode", "binance_rpc", "binance_rpc2"):
-            payload = {"jsonrpc": "2.0", "method": "eth_getBalance", "params": [address, "latest"], "id": 1}
-            data = await rotator.get("", json_payload=payload)
-            if data and 'result' in data:
-                return int(data['result'], 16) / 1e18
-    return 0.0
-
-# ---------- Scanner class ----------
-class SimpleWalletScanner:
+# ---------- Scanner ----------
+class WalletScanner:
     def __init__(self):
         self.mnemo = Mnemonic("english")
         self.semaphore = asyncio.Semaphore(MAX_WORKERS)
-        self.seen_cache = set()
-        self.balance_cache = {}  # address -> (balance, timestamp)
-        self.stats = {"checked": 0, "funded": 0}
+        self.db = DatabaseManager(DATABASE_PATH)
+        self.alert_mgr = AlertManager(self.db)
+        self.seen_cache = LRUCache(10000)
+        self.balance_cache = LRUCache(5000)
+        self.stats = {"checked": 0, "funded": 0, "alerts": 0, "start_time": time.time()}
+        self._stats_lock = threading.Lock()
+        self._shutdown = False
+        self.last_monitoring = time.time()
+        self.last_checked = 0
 
-    def generate_mnemonic(self, strength=128) -> str:
-        entropy = secrets.token_bytes(strength // 8)
-        return self.mnemo.to_mnemonic(entropy)
+    def _update_stats(self, **kwargs):
+        with self._stats_lock:
+            for k, v in kwargs.items():
+                if k in self.stats:
+                    self.stats[k] += v
 
-    async def derive_addresses(self, mnemonic: str, blockchain: str) -> List[str]:
+    def _get_stats(self):
+        with self._stats_lock:
+            return self.stats.copy()
+
+    def generate_mnemonic(self):
+        try:
+            entropy = secrets.token_bytes(16)
+            return self.mnemo.to_mnemonic(entropy)
+        except Exception as e:
+            self.db.log_error("MnemonicGen", str(e))
+            return None
+
+    async def derive_addresses(self, mnemonic: str):
         try:
             seed = self.mnemo.to_seed(mnemonic)
-            root_key = BIP32Key.fromEntropy(seed)
-            coin_type = 0 if blockchain == "bitcoin" else (60 if blockchain == "ethereum" else 714)
+            root = BIP32.from_seed(seed)
+            coin_type = 0 if BLOCKCHAIN == "bitcoin" else (60 if BLOCKCHAIN == "ethereum" else 714)
             addresses = []
-            for change in [0]:
-                for index in range(20):  # gap limit
-                    path_key = root_key \
-                        .ChildKey(44 + 0x80000000) \
-                        .ChildKey(coin_type + 0x80000000) \
-                        .ChildKey(0 + 0x80000000) \
-                        .ChildKey(change) \
-                        .ChildKey(index)
-                    pubkey = path_key.PublicKey()
-                    if blockchain == "bitcoin":
-                        legacy = self._legacy_address(pubkey)
-                        nested = self._nested_segwit_address(pubkey)
-                        native = self._native_segwit_address(pubkey)
-                        addresses.extend([legacy, nested, native])
+            for change in (0,):
+                for idx in range(20):
+                    path = f"m/44'/{coin_type}'/0'/{change}/{idx}"
+                    child = root.derive_path(path)
+                    pub = child.public_key
+                    if BLOCKCHAIN == "bitcoin":
+                        addr = self._native_segwit(pub)
+                        if addr:
+                            addresses.append(addr)
                     else:
-                        priv = EthKeys.PrivateKey(path_key.PrivateKey())
-                        addr = priv.public_key.to_checksum_address()
-                        addresses.append(addr)
-            return list(set(addresses))  # deduplicate
+                        priv = EthKeys.PrivateKey(child.private_key)
+                        addresses.append(priv.public_key.to_checksum_address())
+            return list(set(addresses))
         except Exception as e:
-            logger.error(f"Derivation failed for {mnemonic[:10]}: {e}")
+            self.db.log_error("Derivation", str(e), context=f"mnemonic: {mnemonic[:20]}...")
             return []
 
-    # Bitcoin address helpers
-    def _legacy_address(self, pubkey):
-        sha = hashlib.sha256(pubkey).digest()
-        rip = hashlib.new('ripemd160', sha).digest()
-        return base58.b58encode_check(b'\x00' + rip).decode('utf-8')
+    def _native_segwit(self, pubkey):
+        try:
+            sha = hashlib.sha256(pubkey).digest()
+            rip = hashlib.new('ripemd160', sha).digest()
+            data = convertbits(rip, 8, 5)
+            return bech32_encode("bc", [0] + data)
+        except:
+            return None
 
-    def _nested_segwit_address(self, pubkey):
-        sha = hashlib.sha256(pubkey).digest()
-        rip = hashlib.new('ripemd160', sha).digest()
-        redeem = b'\x00\x14' + rip
-        sha_redeem = hashlib.sha256(redeem).digest()
-        rip_redeem = hashlib.new('ripemd160', sha_redeem).digest()
-        return base58.b58encode_check(b'\x05' + rip_redeem).decode('utf-8')
-
-    def _native_segwit_address(self, pubkey):
-        sha = hashlib.sha256(pubkey).digest()
-        rip = hashlib.new('ripemd160', sha).digest()
-        data = convertbits(rip, 8, 5)
-        return bech32_encode("bc", [0] + data)
-
-    async def get_balances(self, addresses: List[str], blockchain: str) -> Dict[str, float]:
-        """Check cache then external API for each address."""
+    async def get_balances(self, addresses):
         balances = {}
         to_fetch = []
         now = time.time()
         for addr in addresses:
-            if addr in self.balance_cache:
-                bal, ts = self.balance_cache[addr]
-                if now - ts < CACHE_TTL:
-                    balances[addr] = bal
-                    continue
-            to_fetch.append(addr)
-
-        # Fetch uncached addresses with throttling
+            bal, ts = self.balance_cache.get(addr)
+            if bal is not None and now - ts < CACHE_TTL:
+                balances[addr] = bal
+            else:
+                to_fetch.append(addr)
         if to_fetch:
             async with self.semaphore:
                 for addr in to_fetch:
                     try:
-                        if blockchain == "bitcoin":
-                            bal = await get_btc_balance(addr)
+                        if BLOCKCHAIN == "bitcoin":
+                            bal = await self._btc_balance(addr)
                         else:
-                            api_key = ETHERSCAN_KEY if blockchain == "ethereum" else BSCSCAN_KEY
-                            bal = await get_evm_balance(addr, blockchain, api_key)
-                        self.balance_cache[addr] = (bal, time.time())
+                            key = ETHERSCAN_KEY if BLOCKCHAIN == "ethereum" else BSCSCAN_KEY
+                            bal = await self._evm_balance(addr, key)
+                        self.balance_cache.set(addr, bal, time.time())
                         balances[addr] = bal
-                        await asyncio.sleep(0.05)  # rate limit
+                        await asyncio.sleep(0.1)
                     except Exception as e:
-                        logger.debug(f"Balance check failed for {addr}: {e}")
+                        self.db.log_error("BalanceCheck", str(e), context=f"addr:{addr}")
                         balances[addr] = 0.0
         return balances
 
-    async def send_discord_alert(self, mnemonic: str, balances: Dict[str, float], total: float):
-        if not DISCORD_WEBHOOK:
-            return
-        embed = {
-            "title": f"💰 Funded Wallet Found! ({BLOCKCHAIN.upper()})",
-            "color": 0x00ff00,
-            "fields": [
-                {"name": "Mnemonic", "value": f"`{mnemonic}`", "inline": False},
-                {"name": "Total Balance", "value": f"{total:.8f} {BLOCKCHAIN.upper()}", "inline": True},
-                {"name": "Addresses (Top 5)", "value": "\n".join([f"{k}: {v:.8f}" for k, v in list(balances.items())[:5]]), "inline": False},
-            ],
-            "timestamp": datetime.utcnow().isoformat()
-        }
-        payload = {"embeds": [embed]}
+    async def _btc_balance(self, addr):
         try:
             async with aiohttp.ClientSession() as session:
-                await session.post(DISCORD_WEBHOOK, json=payload)
-            logger.info(f"✅ Discord alert sent for balance {total}")
-        except Exception as e:
-            logger.error(f"Failed to send Discord alert: {e}")
+                async with session.get(f"https://mempool.space/api/address/{addr}", timeout=10) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get('chain_stats', {}).get('funded_txo_sum', 0) / 1e8
+        except:
+            pass
+        return 0.0
+
+    async def _evm_balance(self, addr, key):
+        base = "https://api.etherscan.io/api" if BLOCKCHAIN == "ethereum" else "https://api.bscscan.com/api"
+        params = {"module":"account","action":"balance","address":addr,"tag":"latest","apikey":key}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(base, params=params, timeout=10) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get('status') == '1':
+                            return int(data['result']) / 1e18
+        except:
+            pass
+        return 0.0
 
     async def scan_loop(self):
-        while True:
-            mnemonic = self.generate_mnemonic()
-            if mnemonic in self.seen_cache:
-                continue
-            self.seen_cache.add(mnemonic)
+        errors = 0
+        while not self._shutdown:
+            try:
+                mnemonic = self.generate_mnemonic()
+                if not mnemonic:
+                    errors += 1
+                    if errors > 5:
+                        await asyncio.sleep(10)
+                        errors = 0
+                    continue
+                cached, _ = self.seen_cache.get(mnemonic)
+                if cached:
+                    continue
+                self.seen_cache.set(mnemonic, True)
+                addresses = await self.derive_addresses(mnemonic)
+                if not addresses:
+                    errors += 1
+                    if errors > 5:
+                        await asyncio.sleep(5)
+                        errors = 0
+                    continue
+                balances = await self.get_balances(addresses)
+                total = sum(balances.values())
+                self._update_stats(checked=1)
+                errors = 0
+                funded = total > ALERT_MIN_BALANCE
+                wallet_id = self.db.save_wallet(mnemonic, balances, total, funded)
+                if funded and wallet_id:
+                    self._update_stats(funded=1)
+                    logger.info(f"💎 FUNDED! ID:{wallet_id} | Total:{total:.8f} {BLOCKCHAIN.upper()}")
+                    await self.alert_mgr.send_alert(mnemonic, balances, total, wallet_id)
+                    self._update_stats(alerts=1)
+                if self.stats['checked'] % 100 == 0:
+                    rate = self.stats['funded'] / max(self.stats['checked'],1) * 1e6
+                    logger.info(f"📊 Checked:{self.stats['checked']} | Funded:{self.stats['funded']} | Rate:{rate:.2f}/M")
+                await asyncio.sleep(0.02)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Scan loop error: {e}")
+                self.db.log_error("ScanLoop", str(e))
+                errors += 1
+                if errors > 10:
+                    await asyncio.sleep(30)
+                    errors = 0
 
-            addresses = await self.derive_addresses(mnemonic, BLOCKCHAIN)
-            if not addresses:
-                continue
+    async def monitor(self):
+        while not self._shutdown:
+            await asyncio.sleep(MONITORING_INTERVAL)
+            try:
+                now = time.time()
+                dt = now - self.last_monitoring
+                if dt > 0:
+                    rate = (self.stats['checked'] - self.last_checked) / dt
+                else:
+                    rate = 0
+                mem = psutil.Process().memory_info().rss / 1024 / 1024
+                cpu = psutil.Process().cpu_percent()
+                logger.info(f"📊 Health: {self.stats['checked']} checked, {rate:.2f}/s, {mem:.1f}MB, CPU:{cpu:.1f}%")
+                self.last_monitoring = now
+                self.last_checked = self.stats['checked']
+                self.balance_cache.clear_expired(CACHE_TTL)
+                self.seen_cache.clear_expired(86400)
+            except Exception as e:
+                logger.error(f"Monitor error: {e}")
 
-            balances = await self.get_balances(addresses, BLOCKCHAIN)
-            total = sum(balances.values())
-
-            self.stats["checked"] += 1
-            if total > MIN_BALANCE:
-                self.stats["funded"] += 1
-                await self.send_discord_alert(mnemonic, balances, total)
-                logger.info(f"💎 Funded! Mnemonic: {mnemonic} | Total: {total} {BLOCKCHAIN.upper()}")
-
-            if self.stats["checked"] % 100 == 0:
-                hit_rate = self.stats["funded"] / max(self.stats["checked"], 1) * 1e6
-                logger.info(f"📊 {BLOCKCHAIN.upper()} | Checked: {self.stats['checked']} | Funded: {self.stats['funded']} | Rate: {hit_rate:.2f}/M")
-
-            await asyncio.sleep(0.02)
-
-    def start_http_server(self):
-        try:
-            from http.server import HTTPServer, BaseHTTPRequestHandler
-            class HealthHandler(BaseHTTPRequestHandler):
-                def do_GET(self):
-                    self.send_response(200)
-                    self.end_headers()
-                    self.wfile.write(b"OK")
-            port = int(os.environ.get("PORT", 10000))
-            server = HTTPServer(('0.0.0.0', port), HealthHandler)
-            threading.Thread(target=server.serve_forever, daemon=True).start()
-            logger.info(f"🌐 HTTP keep‑alive server on port {port}")
-        except Exception as e:
-            logger.warning(f"Could not start HTTP server: {e}")
+    def stop(self):
+        self._shutdown = True
 
 # ---------- Main ----------
 async def main():
-    scanner = SimpleWalletScanner()
-    scanner.start_http_server()
-
-    logger.info(f"🚀 Starting {BLOCKCHAIN.upper()} scanner with {MAX_WORKERS} workers")
+    scanner = WalletScanner()
+    logger.info(f"🚀 Starting {BLOCKCHAIN.upper()} scanner with Discord alerts only")
+    logger.info(f"📊 Workers:{MAX_WORKERS} | Min Balance:{ALERT_MIN_BALANCE} | Cooldown:{ALERT_COOLDOWN}s")
+    await scanner.alert_mgr.start()
+    monitor_task = asyncio.create_task(scanner.monitor())
     tasks = [asyncio.create_task(scanner.scan_loop()) for _ in range(MAX_WORKERS)]
-    await asyncio.gather(*tasks)
+    try:
+        await asyncio.gather(*tasks, monitor_task)
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+        scanner.stop()
+        await scanner.alert_mgr.stop()
+        for t in tasks + [monitor_task]:
+            t.cancel()
+        await asyncio.gather(*tasks + [monitor_task], return_exceptions=True)
 
 if __name__ == "__main__":
     asyncio.run(main())
