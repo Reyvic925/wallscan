@@ -19,8 +19,13 @@ from bech32 import bech32_encode, convertbits
 
 # ---------- Configuration ----------
 BLOCKCHAIN = os.environ.get("BLOCKCHAIN", "ethereum").lower()
-if BLOCKCHAIN not in ["bitcoin", "ethereum", "bsc"]:
-    raise ValueError("BLOCKCHAIN must be 'bitcoin', 'ethereum', or 'bsc'")
+SUPPORTED_EVM = [
+    "ethereum", "bsc", "polygon", "avalanche", "arbitrum", "optimism",
+    "base", "gnosis", "cronos", "fantom", "metis", "moonbeam", "moonriver",
+    "celo", "scroll", "linea", "blast", "mantle", "kava", "zksync", "zkevm"
+]
+if BLOCKCHAIN not in SUPPORTED_EVM and BLOCKCHAIN != "bitcoin":
+    raise ValueError(f"BLOCKCHAIN must be one of {SUPPORTED_EVM} or 'bitcoin'")
 
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
 if not DISCORD_WEBHOOK:
@@ -34,13 +39,31 @@ MAX_WORKERS = max(1, int(os.environ.get("MAX_WORKERS", "3")))
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "300"))
 NUM_ADDRESSES = int(os.environ.get("NUM_ADDRESSES", "5"))
 
-# ----- API Keys (used only as fallback for Etherscan) -----
-def parse_keys(env_var: str) -> List[str]:
-    return [k.strip() for k in env_var.split(",") if k.strip()]
-
-ETHERSCAN_KEYS = parse_keys(os.environ.get("ETHERSCAN_KEYS", "")) or parse_keys(os.environ.get("ETHERSCAN_KEY", ""))
-if ETHERSCAN_KEYS:
-    logging.info(f"Loaded {len(ETHERSCAN_KEYS)} Etherscan API keys (fallback)")
+# ----- PublicNode RPC endpoints for EVM chains -----
+RPC_ENDPOINTS = {
+    "ethereum": "https://ethereum-rpc.publicnode.com",
+    "bsc":      "https://bsc-rpc.publicnode.com",
+    "polygon":  "https://polygon-rpc.publicnode.com",
+    "avalanche":"https://avalanche-rpc.publicnode.com",
+    "arbitrum": "https://arbitrum-rpc.publicnode.com",
+    "optimism": "https://optimism-rpc.publicnode.com",
+    "base":     "https://base-rpc.publicnode.com",
+    "gnosis":   "https://gnosis-rpc.publicnode.com",
+    "cronos":   "https://cronos-rpc.publicnode.com",
+    "fantom":   "https://fantom-rpc.publicnode.com",
+    "metis":    "https://metis-rpc.publicnode.com",
+    "moonbeam": "https://moonbeam-rpc.publicnode.com",
+    "moonriver":"https://moonriver-rpc.publicnode.com",
+    "celo":     "https://celo-rpc.publicnode.com",
+    "scroll":   "https://scroll-rpc.publicnode.com",
+    "linea":    "https://linea-rpc.publicnode.com",
+    "blast":    "https://blast-rpc.publicnode.com",
+    "mantle":   "https://mantle-rpc.publicnode.com",
+    "kava":     "https://kava-rpc.publicnode.com",
+    "zksync":   "https://zksync-era-rpc.publicnode.com",
+    "zkevm":    "https://polygon-zkevm-rpc.publicnode.com",
+    # Add more from https://www.publicnode.com/ as needed
+}
 
 # Logging
 logging.basicConfig(
@@ -75,21 +98,6 @@ class LRUCache:
         for k in list(self.cache.keys()):
             if now - self.cache[k][1] > ttl:
                 del self.cache[k]
-
-# ---------- Key Rotator (for Etherscan fallback) ----------
-class KeyRotator:
-    def __init__(self, keys: List[str]):
-        self.keys = keys
-        self.index = 0
-        self._lock = asyncio.Lock()
-
-    async def get_key(self) -> Optional[str]:
-        if not self.keys:
-            return None
-        async with self._lock:
-            key = self.keys[self.index]
-            self.index = (self.index + 1) % len(self.keys)
-            return key
 
 # ---------- Alert Manager ----------
 class AlertManager:
@@ -159,7 +167,7 @@ class AlertManager:
                 {"name": "🆔 Wallet ID", "value": str(wallet_id), "inline": True},
                 {"name": "🕐 Found At", "value": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"), "inline": True}
             ],
-            "footer": {"text": f"Scanner v2.0 | {BLOCKCHAIN.upper()}"},
+            "footer": {"text": f"Scanner v3.0 | {BLOCKCHAIN.upper()}"},
             "timestamp": datetime.utcnow().isoformat()
         }
         async with aiohttp.ClientSession() as session:
@@ -179,8 +187,13 @@ class WalletScanner:
         self._shutdown = False
         self.wallet_counter = 0
 
-        # Fallback key rotator for Etherscan (if blockchain.com fails)
-        self.etherscan_rotator = KeyRotator(ETHERSCAN_KEYS) if ETHERSCAN_KEYS else None
+        # RPC endpoint for the current blockchain
+        if BLOCKCHAIN == "bitcoin":
+            self.rpc_url = None
+        else:
+            self.rpc_url = RPC_ENDPOINTS.get(BLOCKCHAIN)
+            if not self.rpc_url:
+                raise ValueError(f"No RPC endpoint defined for {BLOCKCHAIN}. Please add to RPC_ENDPOINTS.")
 
     def generate_mnemonic(self):
         try:
@@ -194,7 +207,12 @@ class WalletScanner:
         try:
             seed = self.mnemo.to_seed(mnemonic)
             root_key = BIP32Key.fromEntropy(seed)
-            coin_type = 0 if BLOCKCHAIN == "bitcoin" else (60 if BLOCKCHAIN == "ethereum" else 714)
+            if BLOCKCHAIN == "bitcoin":
+                coin_type = 0
+            else:
+                # EVM chains use coin_type 60 for Ethereum, but BSC and others also use 60.
+                # For compatibility, we use 60 for all EVM chains listed.
+                coin_type = 60
             addresses = []
             for change in (0,):
                 for idx in range(NUM_ADDRESSES):
@@ -250,7 +268,6 @@ class WalletScanner:
                         if BLOCKCHAIN == "bitcoin":
                             bal = await self._btc_balance(addr)
                         else:
-                            # Try blockchain.com first, fallback to Etherscan
                             bal = await self._evm_balance(addr)
                         self.balance_cache.set(addr, bal, time.time())
                         return addr, bal
@@ -263,78 +280,35 @@ class WalletScanner:
                 balances[addr] = bal
         return balances
 
-    # ----- New: blockchain.com balance check -----
-    async def _blockchain_com_balance(self, address: str) -> Optional[float]:
-        """Try blockchain.com API first."""
-        url = f"https://api.blockchain.info/v2/eth/address/{address}/balance"
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=10) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if 'balance' in data:
-                            return data['balance'] / 1e18
-                    elif resp.status == 429:
-                        # Rate limited – wait a bit and retry once
-                        await asyncio.sleep(2)
-                        async with session.get(url, timeout=10) as retry_resp:
-                            if retry_resp.status == 200:
-                                data = await retry_resp.json()
-                                if 'balance' in data:
-                                    return data['balance'] / 1e18
-        except Exception as e:
-            logger.debug(f"blockchain.com error for {address}: {e}")
-        return None
-
-    # ----- Fallback: Etherscan -----
-    async def _etherscan_balance(self, address: str) -> Optional[float]:
-        """Fallback to Etherscan (requires API key)."""
-        if not self.etherscan_rotator:
-            return None
-        key = await self.etherscan_rotator.get_key()
-        if not key:
-            return None
-        base = "https://api.etherscan.io/api"
-        params = {
-            "module": "account",
-            "action": "balance",
-            "address": address,
-            "tag": "latest",
-            "apikey": key
+    # ----- EVM balance via PublicNode RPC -----
+    async def _evm_balance(self, address: str) -> float:
+        """Fetch balance using PublicNode JSON-RPC."""
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "eth_getBalance",
+            "params": [address, "latest"],
+            "id": 1
         }
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(base, params=params, timeout=10) as resp:
+                async with session.post(self.rpc_url, json=payload, timeout=10) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        if data.get('status') == '1':
-                            return int(data['result']) / 1e18
+                        if 'result' in data:
+                            return int(data['result'], 16) / 1e18
                     elif resp.status == 429:
                         # Rate limited – wait and retry once
                         await asyncio.sleep(2)
-                        async with session.get(base, params=params, timeout=10) as retry_resp:
+                        async with session.post(self.rpc_url, json=payload, timeout=10) as retry_resp:
                             if retry_resp.status == 200:
                                 data = await retry_resp.json()
-                                if data.get('status') == '1':
-                                    return int(data['result']) / 1e18
+                                if 'result' in data:
+                                    return int(data['result'], 16) / 1e18
         except Exception as e:
-            logger.debug(f"Etherscan error for {address}: {e}")
-        return None
-
-    async def _evm_balance(self, address: str) -> float:
-        """Try blockchain.com, fallback to Etherscan."""
-        # First try blockchain.com
-        bal = await self._blockchain_com_balance(address)
-        if bal is not None:
-            return bal
-        # Fallback to Etherscan
-        bal = await self._etherscan_balance(address)
-        if bal is not None:
-            return bal
-        # If both fail, return 0
+            logger.debug(f"RPC error for {address}: {e}")
         return 0.0
 
-    # Bitcoin uses mempool.space (unchanged)
+    # ----- Bitcoin via mempool.space -----
     async def _btc_balance(self, addr):
         try:
             async with aiohttp.ClientSession() as session:
@@ -443,10 +417,10 @@ async def main():
     scanner = WalletScanner()
     logger.info(f"🚀 Starting {BLOCKCHAIN.upper()} scanner with Discord alerts")
     logger.info(f"📊 Workers:{MAX_WORKERS} | Min Balance:{ALERT_MIN_BALANCE} | Addresses per wallet:{NUM_ADDRESSES}")
-    if scanner.etherscan_rotator:
-        logger.info(f"🔑 Loaded {len(scanner.etherscan_rotator.keys)} Etherscan keys as fallback")
+    if BLOCKCHAIN != "bitcoin":
+        logger.info(f"🔗 Using RPC endpoint: {scanner.rpc_url}")
     else:
-        logger.info("ℹ️  No Etherscan keys provided – will only use blockchain.com")
+        logger.info("🔗 Using mempool.space for Bitcoin")
 
     # Startup test
     logger.info("🧪 Running startup test...")
@@ -458,13 +432,14 @@ async def main():
     else:
         logger.error("❌ Failed to generate test mnemonic!")
 
-    # Test blockchain.com API
-    test_addr = "0x0000000000000000000000000000000000000000"
-    bal = await scanner._blockchain_com_balance(test_addr)
-    if bal is not None:
-        logger.info(f"✅ blockchain.com API works (balance of null address: {bal:.18f} ETH)")
-    else:
-        logger.warning("⚠️  blockchain.com API failed – will use Etherscan fallback if available")
+    # Test RPC connection (for EVM)
+    if BLOCKCHAIN != "bitcoin":
+        test_addr = "0x0000000000000000000000000000000000000000"
+        bal = await scanner._evm_balance(test_addr)
+        if bal is not None:
+            logger.info(f"✅ RPC works (balance of null address: {bal:.18f} {BLOCKCHAIN.upper()})")
+        else:
+            logger.warning("⚠️  RPC failed – check endpoint and network connectivity")
 
     logger.info("🧪 Startup test complete – starting main loop")
 
