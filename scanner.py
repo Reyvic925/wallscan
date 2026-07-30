@@ -7,7 +7,7 @@ import hashlib
 import secrets
 import threading
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 from collections import OrderedDict
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -18,6 +18,7 @@ from bip32utils import BIP32Key
 from eth_keys import keys as EthKeys
 from bech32 import bech32_encode, convertbits
 from eth_account import Account
+import base58
 
 Account.enable_unaudited_hdwallet_features()
 
@@ -41,9 +42,7 @@ ALERT_MAX_PER_HOUR = int(os.environ.get("ALERT_MAX_PER_HOUR", "5"))
 
 MAX_WORKERS = max(1, int(os.environ.get("MAX_WORKERS", "2")))
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "300"))
-NUM_ADDRESSES = int(os.environ.get("NUM_ADDRESSES", "1"))
-
-# Batch size for both EVM and Bitcoin
+NUM_ADDRESSES = int(os.environ.get("NUM_ADDRESSES", "1"))   # per address type
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "50"))
 
 # ----- Public RPC endpoints (EVM only) -----
@@ -112,7 +111,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------- RPC Rotator for Load Balancing & Fault Tolerance (EVM only) ----------
+# ---------- RPC Rotator (EVM) ----------
 class RPCRotator:
     def __init__(self, urls: List[str]):
         self.urls = urls
@@ -217,29 +216,28 @@ class AlertManager:
                  "value": "\n".join([f"`{addr}`: {bal:.8f}" for addr, bal in list(funded.items())[:10]]),
                  "inline": False},
                 {"name": "🆔 Wallet ID", "value": str(wallet_id), "inline": True},
-                {"name": "🕐 Found At", "value": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"), "inline": True}
+                {"name": "🕐 Found At", "value": datetime.now(timezone.UTC).strftime("%Y-%m-%d %H:%M:%S UTC"), "inline": True}
             ],
-            "footer": {"text": f"Scanner v4.7 (Bitcoin Batch) | {BLOCKCHAIN.upper()}"},
-            "timestamp": datetime.utcnow().isoformat()
+            "footer": {"text": f"Scanner v4.9 (BTC multi-type) | {BLOCKCHAIN.upper()}"},
+            "timestamp": datetime.now(timezone.UTC).isoformat()
         }
         async with aiohttp.ClientSession() as session:
             async with session.post(DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=10) as resp:
                 if resp.status not in (200, 204):
                     raise Exception(f"Discord returned {resp.status}")
 
-    # ---------- Send test alert on startup ----------
     async def send_test_alert(self):
         embed = {
             "title": f"🚀 Scanner Started ({BLOCKCHAIN.upper()})",
             "color": 0x00aaff,
             "fields": [
-                {"name": "🕐 Started At", "value": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"), "inline": True},
+                {"name": "🕐 Started At", "value": datetime.now(timezone.UTC).strftime("%Y-%m-%d %H:%M:%S UTC"), "inline": True},
                 {"name": "⚙️ Configuration",
                  "value": f"Workers: {MAX_WORKERS}\nBatch size: {BATCH_SIZE}\nMin balance: {ALERT_MIN_BALANCE}\nAddresses per wallet: {NUM_ADDRESSES}",
                  "inline": False}
             ],
             "footer": {"text": "Test notification – scanner is online"},
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.now(timezone.UTC).isoformat()
         }
         try:
             async with aiohttp.ClientSession() as session:
@@ -250,6 +248,40 @@ class AlertManager:
                         logger.warning(f"⚠️ Discord webhook test returned {resp.status} – check your webhook URL")
         except Exception as e:
             logger.warning(f"⚠️ Discord webhook test failed: {e} – continuing anyway")
+
+# ---------- Address helpers for Bitcoin ----------
+def hash160(data):
+    """Return ripemd160(sha256(data))"""
+    sha = hashlib.sha256(data).digest()
+    rip = hashlib.new('ripemd160', sha).digest()
+    return rip
+
+def p2pkh_address(pubkey):
+    """P2PKH (Legacy) address starting with 1"""
+    h160 = hash160(pubkey)
+    # version 0x00 for mainnet
+    versioned = b'\x00' + h160
+    checksum = hashlib.sha256(hashlib.sha256(versioned).digest()).digest()[:4]
+    return base58.b58encode(versioned + checksum).decode()
+
+def p2sh_segwit_address(pubkey):
+    """P2SH-SegWit address starting with 3 (redeem script: 0x0014 + hash160(pubkey))"""
+    h160 = hash160(pubkey)
+    redeem_script = b'\x00\x14' + h160  # OP_0 + push 20 bytes
+    script_hash = hash160(redeem_script)
+    versioned = b'\x05' + script_hash  # 0x05 for P2SH mainnet
+    checksum = hashlib.sha256(hashlib.sha256(versioned).digest()).digest()[:4]
+    return base58.b58encode(versioned + checksum).decode()
+
+def native_segwit_address(pubkey):
+    """Native SegWit (bech32) address starting with bc1"""
+    h160 = hash160(pubkey)
+    # convert to 5-bit words for bech32
+    data = convertbits(h160, 8, 5)
+    if data is None:
+        return None
+    # witness version 0x00 -> first data byte 0
+    return bech32_encode("bc", [0] + data)
 
 # ---------- Scanner ----------
 class WalletScanner:
@@ -290,27 +322,34 @@ class WalletScanner:
             try:
                 seed = self.mnemo.to_seed(mnemonic)
                 root_key = BIP32Key.fromEntropy(seed)
-                for change in (0,):
-                    for idx in range(NUM_ADDRESSES):
-                        try:
-                            child_key = root_key \
-                                .ChildKey(44 + 0x80000000) \
-                                .ChildKey(0 + 0x80000000) \
-                                .ChildKey(0 + 0x80000000) \
-                                .ChildKey(change) \
-                                .ChildKey(idx)
-                            pubkey = child_key.PublicKey()
-                            addr = self._native_segwit_address(pubkey)
-                            if addr:
-                                addresses.append(addr)
-                        except Exception as e:
-                            logger.error(f"BTC deriv failed idx {idx}: {e}")
-                            continue
+                # For each address type (purpose)
+                for purpose, addr_func in [
+                    (44, p2pkh_address),      # Legacy
+                    (49, p2sh_segwit_address),# P2SH-SegWit
+                    (84, native_segwit_address)# Native SegWit
+                ]:
+                    # Derive the purpose-level key once
+                    purpose_key = root_key.ChildKey(purpose + 0x80000000)
+                    coin_key = purpose_key.ChildKey(0 + 0x80000000)  # Bitcoin mainnet
+                    account_key = coin_key.ChildKey(0 + 0x80000000)  # account 0
+                    for change in (0,):  # external addresses only
+                        change_key = account_key.ChildKey(change)
+                        for idx in range(NUM_ADDRESSES):
+                            try:
+                                child_key = change_key.ChildKey(idx)
+                                pubkey = child_key.PublicKey()
+                                addr = addr_func(pubkey)
+                                if addr:
+                                    addresses.append(addr)
+                            except Exception as e:
+                                logger.error(f"BTC deriv failed idx {idx} for purpose {purpose}: {e}")
+                                continue
                 return list(set(addresses))
             except Exception as e:
                 logger.error(f"BTC derivation error: {e}")
                 return []
         else:
+            # EVM: single address per index (unchanged)
             try:
                 for change in (0,):
                     for idx in range(NUM_ADDRESSES):
@@ -330,16 +369,7 @@ class WalletScanner:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self.executor, self._derive_addresses_sync, mnemonic)
 
-    def _native_segwit_address(self, pubkey):
-        try:
-            sha = hashlib.sha256(pubkey).digest()
-            rip = hashlib.new('ripemd160', sha).digest()
-            data = convertbits(rip, 8, 5)
-            return bech32_encode("bc", [0] + data)
-        except:
-            return None
-
-    # ---------- EVM batch balance (unchanged) ----------
+    # ---------- EVM batch balance ----------
     async def _fetch_evm_balances_batch(self, addresses: List[str]) -> Dict[str, float]:
         if not addresses:
             return {}
@@ -382,54 +412,49 @@ class WalletScanner:
         logger.error("All EVM RPC nodes failed. Returning zero balances.")
         return {addr: 0.0 for addr in addresses}
 
-    # ---------- NEW: Bitcoin batch balance via blockchair.com ----------
+    # ---------- Bitcoin batch balance (with concurrent fallback) ----------
     async def _fetch_btc_balances_batch(self, addresses: List[str]) -> Dict[str, float]:
         if not addresses:
             return {}
-        # Blockchair supports up to 100 addresses per request (we use BATCH_SIZE=50)
+        
+        # Try blockchair with proper headers and retry
         url = f"https://api.blockchair.com/bitcoin/dashboards/addresses/{','.join(addresses)}"
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=15) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        balances = {}
-                        for addr in addresses:
-                            # Blockchair returns data['data'][addr]['address']['balance'] in satoshis
-                            addr_data = data.get('data', {}).get(addr, {})
-                            balance_sat = addr_data.get('address', {}).get('balance', 0)
-                            balances[addr] = balance_sat / 1e8
-                        return balances
-                    elif resp.status == 429:
-                        logger.warning("Blockchair rate limit, waiting 2s and retrying once...")
-                        await asyncio.sleep(2)
-                        # retry once
-                        async with session.get(url, timeout=15) as retry_resp:
-                            if retry_resp.status == 200:
-                                data = await retry_resp.json()
-                                balances = {}
-                                for addr in addresses:
-                                    addr_data = data.get('data', {}).get(addr, {})
-                                    balance_sat = addr_data.get('address', {}).get('balance', 0)
-                                    balances[addr] = balance_sat / 1e8
-                                return balances
-                    else:
-                        logger.warning(f"Blockchair returned HTTP {resp.status}")
-        except Exception as e:
-            logger.warning(f"Blockchair batch error: {e}")
-
-        # Fallback: fetch each address individually via mempool.space (slow but reliable)
-        logger.info(f"Falling back to individual mempool.space requests for {len(addresses)} addresses")
-        balances = {}
-        for addr in addresses:
-            bal = await self._btc_balance(addr)
-            balances[addr] = bal
-            # small delay to avoid hammering mempool
-            await asyncio.sleep(0.1)
-        return balances
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        for attempt in range(2):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, headers=headers, timeout=15) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            balances = {}
+                            for addr in addresses:
+                                addr_data = data.get('data', {}).get(addr, {})
+                                balance_sat = addr_data.get('address', {}).get('balance', 0)
+                                balances[addr] = balance_sat / 1e8
+                            return balances
+                        elif resp.status in (429, 430):
+                            wait = 2 ** attempt
+                            logger.warning(f"Blockchair rate limit ({resp.status}), waiting {wait}s...")
+                            await asyncio.sleep(wait)
+                            continue
+                        else:
+                            logger.warning(f"Blockchair HTTP {resp.status}")
+                            break
+            except Exception as e:
+                logger.warning(f"Blockchair error: {e}")
+                await asyncio.sleep(1)
+        
+        # Fallback: concurrent mempool.space requests
+        logger.info(f"Falling back to concurrent mempool.space requests for {len(addresses)} addresses")
+        sem = asyncio.Semaphore(10)
+        async def fetch_one(addr):
+            async with sem:
+                return addr, await self._btc_balance(addr)
+        tasks = [fetch_one(addr) for addr in addresses]
+        results = await asyncio.gather(*tasks)
+        return dict(results)
 
     async def _btc_balance(self, addr):
-        """Individual Bitcoin balance check via mempool.space (fallback)"""
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(f"https://mempool.space/api/address/{addr}", timeout=10) as resp:
@@ -440,7 +465,7 @@ class WalletScanner:
             pass
         return 0.0
 
-    # ---------- Unified batch balance (selects EVM or Bitcoin) ----------
+    # ---------- Unified batch balance ----------
     async def _fetch_balances_batch(self, addresses: List[str]) -> Dict[str, float]:
         if self.is_evm:
             return await self._fetch_evm_balances_batch(addresses)
@@ -465,10 +490,10 @@ class WalletScanner:
                 result[addr] = bal
         return result
 
-    # ---------- Main scan loop with batching for both EVM and Bitcoin ----------
+    # ---------- Main scan loop ----------
     async def scan_loop(self):
         errors = 0
-        pending = []   # list of (mnemonic, addresses_list)
+        pending = []
         while not self._shutdown:
             try:
                 mnemonic = self.generate_mnemonic()
@@ -535,7 +560,6 @@ class WalletScanner:
                             elapsed = time.time() - self.stats['start_time']
                             logger.info(f"📊 Checked:{self.stats['checked']} | Funded:{self.stats['funded']} | Rate:{rate:.2f}/M | {elapsed:.0f}s elapsed")
 
-                    # Polite throttling after each batch (both EVM and Bitcoin)
                     await asyncio.sleep(random.uniform(0.1, 0.3))
                     pending = []
 
@@ -587,17 +611,16 @@ async def main():
     logger.info(f"🌐 HTTP health server running on port {port}")
 
     scanner = WalletScanner()
+    addr_types = "Legacy, P2SH-SegWit, Native SegWit" if BLOCKCHAIN == "bitcoin" else "EVM (single type)"
     logger.info(f"🚀 Starting {BLOCKCHAIN.upper()} scanner with Discord alerts & Batch fetching")
     logger.info(f"📊 Workers:{MAX_WORKERS} | Min Balance:{ALERT_MIN_BALANCE} | Addresses per wallet:{NUM_ADDRESSES} | Batch size:{BATCH_SIZE}")
-    
+    logger.info(f"📌 Address types: {addr_types}")
+
     if scanner.is_evm:
         logger.info(f"🔗 Using {len(scanner.rpc_rotator.urls)} rotating RPC endpoints for {BLOCKCHAIN.upper()}")
-        logger.info("🛡️ Batch-level throttling enabled for EVM")
     else:
-        logger.info("🔗 Using blockchair.com batch API for Bitcoin (fallback to mempool.space)")
-        logger.info("🛡️ Batch-level throttling enabled for Bitcoin")
+        logger.info("🔗 Using blockchair.com batch API for Bitcoin (fallback to concurrent mempool.space)")
 
-    # ---------- STARTUP TEST: Discord webhook ----------
     logger.info("📢 Testing Discord webhook...")
     await scanner.alert_mgr.send_test_alert()
 
@@ -618,8 +641,7 @@ async def main():
         else:
             logger.warning("⚠️  EVM batch RPC failed – check your network or endpoint availability")
     else:
-        # Test Bitcoin batch with a known address (e.g., genesis address)
-        test_addr = "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"  # Genesis block address (has some BTC)
+        test_addr = "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"
         balances = await scanner._fetch_btc_balances_batch([test_addr])
         if balances and balances.get(test_addr) is not None:
             logger.info(f"✅ Bitcoin batch API works (balance of genesis address: {balances[test_addr]:.8f} BTC)")
