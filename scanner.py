@@ -218,7 +218,7 @@ class AlertManager:
                 {"name": "🆔 Wallet ID", "value": str(wallet_id), "inline": True},
                 {"name": "🕐 Found At", "value": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"), "inline": True}
             ],
-            "footer": {"text": f"Scanner v5.0 (Bitcoin Multi-API Rotator) | {BLOCKCHAIN.upper()}"},
+            "footer": {"text": f"Scanner v5.1 (Verification Alert) | {BLOCKCHAIN.upper()}"},
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
         async with aiohttp.ClientSession() as session:
@@ -226,6 +226,7 @@ class AlertManager:
                 if resp.status not in (200, 204):
                     raise Exception(f"Discord returned {resp.status}")
 
+    # ---------- Startup test notifications ----------
     async def send_test_alert(self):
         embed = {
             "title": f"🚀 Scanner Started ({BLOCKCHAIN.upper()})",
@@ -248,6 +249,32 @@ class AlertManager:
                         logger.warning(f"⚠️ Discord webhook test returned {resp.status} – check your webhook URL")
         except Exception as e:
             logger.warning(f"⚠️ Discord webhook test failed: {e} – continuing anyway")
+
+    # ---------- Verification alert (new) ----------
+    async def send_verification_alert(self, mnemonic: str, addresses: List[str]):
+        """Send a verification alert with the test mnemonic and derived addresses."""
+        addr_list = "\n".join([f"`{addr}`" for addr in addresses[:10]])
+        if len(addresses) > 10:
+            addr_list += f"\n... and {len(addresses)-10} more"
+        embed = {
+            "title": f"🔍 Address Verification ({BLOCKCHAIN.upper()})",
+            "color": 0x00aaff,
+            "fields": [
+                {"name": "🔑 Mnemonic", "value": f"`{mnemonic}`", "inline": False},
+                {"name": "📌 Derived Addresses", "value": addr_list, "inline": False}
+            ],
+            "footer": {"text": "Verify these addresses match the mnemonic"},
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=10) as resp:
+                    if resp.status in (200, 204):
+                        logger.info("✅ Verification alert sent to Discord")
+                    else:
+                        logger.warning(f"⚠️ Verification alert returned {resp.status}")
+        except Exception as e:
+            logger.warning(f"⚠️ Verification alert failed: {e}")
 
 # ---------- Address helpers for Bitcoin ----------
 def hash160(data):
@@ -404,10 +431,8 @@ class WalletScanner:
 
     # ---------- Bitcoin API methods ----------
     async def _blockchain_com_batch(self, addresses: List[str]) -> Dict[str, float]:
-        """blockchain.com batch balance (supports up to 50 addresses)"""
         if not addresses:
             return {}
-        # Format: active=addr1|addr2|...
         active = '|'.join(addresses)
         url = f"https://blockchain.info/balance?active={active}"
         headers = {"User-Agent": "Mozilla/5.0"}
@@ -418,7 +443,6 @@ class WalletScanner:
                         data = await resp.json()
                         balances = {}
                         for addr, info in data.items():
-                            # info is a dict with 'final_balance' in satoshis
                             balance_sat = info.get('final_balance', 0)
                             balances[addr] = balance_sat / 1e8
                         return balances
@@ -433,12 +457,11 @@ class WalletScanner:
             return {}
 
     async def _blockchair_batch(self, addresses: List[str]) -> Dict[str, float]:
-        """Blockchair batch with exponential backoff"""
         if not addresses:
             return {}
         url = f"https://api.blockchair.com/bitcoin/dashboards/addresses/{','.join(addresses)}"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        for attempt in range(3):  # 3 attempts with backoff
+        for attempt in range(3):
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(url, headers=headers, timeout=15) as resp:
@@ -451,7 +474,7 @@ class WalletScanner:
                                 balances[addr] = balance_sat / 1e8
                             return balances
                         elif resp.status in (429, 430):
-                            wait = (3 ** attempt) + random.uniform(0, 1)  # 3s, 9s, 27s
+                            wait = (3 ** attempt) + random.uniform(0, 1)
                             logger.warning(f"Blockchair rate limit ({resp.status}), waiting {wait:.1f}s...")
                             await asyncio.sleep(wait)
                             continue
@@ -464,7 +487,6 @@ class WalletScanner:
         return {}
 
     async def _mempool_concurrent(self, addresses: List[str]) -> Dict[str, float]:
-        """Fallback: concurrent mempool.space requests (10 at a time)"""
         logger.info(f"Falling back to concurrent mempool.space requests for {len(addresses)} addresses")
         sem = asyncio.Semaphore(10)
         async def fetch_one(addr):
@@ -484,26 +506,17 @@ class WalletScanner:
         return dict(results)
 
     async def _fetch_btc_balances_batch(self, addresses: List[str]) -> Dict[str, float]:
-        """
-        Multi-API rotator for Bitcoin:
-        1. blockchain.com (batch)
-        2. Blockchair (batch with backoff)
-        3. Concurrent mempool.space (fallback)
-        """
         if not addresses:
             return {}
 
-        # Try blockchain.com first
         balances = await self._blockchain_com_batch(addresses)
         if balances and all(bal is not None for bal in balances.values()):
             return balances
 
-        # If blockchain.com fails or gave partial, try Blockchair
         balances = await self._blockchair_batch(addresses)
         if balances and all(bal is not None for bal in balances.values()):
             return balances
 
-        # Final fallback: concurrent mempool.space
         return await self._mempool_concurrent(addresses)
 
     # ---------- Unified batch balance ----------
@@ -662,6 +675,7 @@ async def main():
     else:
         logger.info("🔗 Bitcoin Multi-API Rotator: blockchain.com → Blockchair → concurrent mempool.space")
 
+    # ---------- STARTUP NOTIFICATIONS ----------
     logger.info("📢 Testing Discord webhook...")
     await scanner.alert_mgr.send_test_alert()
 
@@ -671,9 +685,13 @@ async def main():
         logger.info(f"✅ Mnemonic generated: {test_mnemonic[:20]}...")
         test_addresses = await scanner.derive_addresses(test_mnemonic)
         logger.info(f"✅ Derived {len(test_addresses)} addresses")
+        # Send verification alert with the test addresses
+        logger.info("📤 Sending verification alert with derived addresses...")
+        await scanner.alert_mgr.send_verification_alert(test_mnemonic, test_addresses)
     else:
         logger.error("❌ Failed to generate test mnemonic!")
 
+    # ---------- API connectivity tests ----------
     if scanner.is_evm:
         test_addr = "0x0000000000000000000000000000000000000000"
         balances = await scanner._fetch_evm_balances_batch([test_addr])
