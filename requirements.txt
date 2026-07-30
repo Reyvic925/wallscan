@@ -1,6 +1,7 @@
-mnemonic 
-bip32utils 
-eth-keys 
-bech32 
-aiohttp 
-base58 
+aiohttp>=3.8.0
+mnemonic>=0.20
+bip32>=2.0.0
+eth-keys>=0.4.0
+bech32>=1.2.0
+base58>=2.1.0
+psutil>=5.9.0
