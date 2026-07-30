@@ -6,9 +6,11 @@ import aiohttp
 import hashlib
 import base58
 import secrets
+import threading
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from mnemonic import Mnemonic
 from bip32utils import BIP32Key
@@ -27,16 +29,28 @@ if not DISCORD_WEBHOOK.startswith("https://discord.com/api/webhooks/"):
     raise ValueError("Invalid DISCORD_WEBHOOK URL")
 
 ALERT_MIN_BALANCE = float(os.environ.get("ALERT_MIN_BALANCE", "0.001"))
-ALERT_COOLDOWN = int(os.environ.get("ALERT_COOLDOWN", "300"))      # seconds
+ALERT_COOLDOWN = int(os.environ.get("ALERT_COOLDOWN", "300"))
 ALERT_MAX_PER_HOUR = int(os.environ.get("ALERT_MAX_PER_HOUR", "5"))
 
 MAX_WORKERS = max(1, int(os.environ.get("MAX_WORKERS", "3")))
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "300"))
 
-ETHERSCAN_KEY = os.environ.get("ETHERSCAN_KEY", "")
-BSCSCAN_KEY = os.environ.get("BSCSCAN_KEY", "")
-if BLOCKCHAIN in ["ethereum", "bsc"] and not (ETHERSCAN_KEY if BLOCKCHAIN == "ethereum" else BSCSCAN_KEY):
-    logging.warning(f"No API key provided for {BLOCKCHAIN}. Rate limits will be strict.")
+# API keys – support multiple keys
+def parse_keys(env_var: str) -> List[str]:
+    return [k.strip() for k in env_var.split(",") if k.strip()]
+
+if BLOCKCHAIN == "ethereum":
+    ETHERSCAN_KEYS = parse_keys(os.environ.get("ETHERSCAN_KEYS", "")) or (
+        [os.environ.get("ETHERSCAN_KEY", "")] if os.environ.get("ETHERSCAN_KEY", "") else []
+    )
+    if not ETHERSCAN_KEYS:
+        logging.warning("No Etherscan API keys provided. Rate limits will be strict.")
+elif BLOCKCHAIN == "bsc":
+    BSCSCAN_KEYS = parse_keys(os.environ.get("BSCSCAN_KEYS", "")) or (
+        [os.environ.get("BSCSCAN_KEY", "")] if os.environ.get("BSCSCAN_KEY", "") else []
+    )
+    if not BSCSCAN_KEYS:
+        logging.warning("No BscScan API keys provided. Rate limits will be strict.")
 
 # Logging
 logging.basicConfig(
@@ -72,13 +86,28 @@ class LRUCache:
             if now - self.cache[k][1] > ttl:
                 del self.cache[k]
 
+# ---------- Key Rotator ----------
+class KeyRotator:
+    def __init__(self, keys: List[str]):
+        self.keys = keys
+        self.index = 0
+        self._lock = asyncio.Lock()
+
+    async def get_key(self) -> Optional[str]:
+        if not self.keys:
+            return None
+        async with self._lock:
+            key = self.keys[self.index]
+            self.index = (self.index + 1) % len(self.keys)
+            return key
+
 # ---------- Alert Manager (Discord only, in-memory) ----------
 class AlertManager:
     def __init__(self):
         self.queue = asyncio.Queue()
         self.running = True
-        self.rate_limit = []          # timestamps of alerts in last hour
-        self.last_alerted = {}        # wallet_id -> timestamp
+        self.rate_limit = []
+        self.last_alerted = {}
 
     async def start(self):
         asyncio.create_task(self._worker())
@@ -114,7 +143,6 @@ class AlertManager:
                     logger.warning("Alert rate limit reached, skipping")
                     self.queue.task_done()
                     continue
-                # Send Discord
                 try:
                     await self._send_discord(mnemonic, balances, total, wallet_id)
                     self.last_alerted[wallet_id] = time.time()
@@ -144,7 +172,6 @@ class AlertManager:
             "footer": {"text": f"Scanner v2.0 | {BLOCKCHAIN.upper()}"},
             "timestamp": datetime.utcnow().isoformat()
         }
-
         async with aiohttp.ClientSession() as session:
             async with session.post(DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=10) as resp:
                 if resp.status not in (200, 204):
@@ -197,7 +224,14 @@ class WalletScanner:
         self.balance_cache = LRUCache(5000)
         self.stats = {"checked": 0, "funded": 0, "alerts": 0, "start_time": time.time()}
         self._shutdown = False
-        self.wallet_counter = 0   # simple incrementing ID
+        self.wallet_counter = 0
+
+        if BLOCKCHAIN == "ethereum":
+            self.key_rotator = KeyRotator(ETHERSCAN_KEYS if 'ETHERSCAN_KEYS' in globals() else [])
+        elif BLOCKCHAIN == "bsc":
+            self.key_rotator = KeyRotator(BSCSCAN_KEYS if 'BSCSCAN_KEYS' in globals() else [])
+        else:
+            self.key_rotator = None
 
     def generate_mnemonic(self):
         try:
@@ -224,7 +258,6 @@ class WalletScanner:
                             .ChildKey(idx)
                         pubkey = child_key.PublicKey()
                         if BLOCKCHAIN == "bitcoin":
-                            # Native SegWit address
                             addr = self._native_segwit_address(pubkey)
                             if addr:
                                 addresses.append(addr)
@@ -259,6 +292,7 @@ class WalletScanner:
                 balances[addr] = bal
             else:
                 to_fetch.append(addr)
+
         if to_fetch:
             async with self.semaphore:
                 for addr in to_fetch:
@@ -266,7 +300,7 @@ class WalletScanner:
                         if BLOCKCHAIN == "bitcoin":
                             bal = await self._btc_balance(addr)
                         else:
-                            key = ETHERSCAN_KEY if BLOCKCHAIN == "ethereum" else BSCSCAN_KEY
+                            key = await self.key_rotator.get_key() if self.key_rotator else ""
                             bal = await self._evm_balance(addr, key)
                         self.balance_cache.set(addr, bal, time.time())
                         balances[addr] = bal
@@ -289,7 +323,13 @@ class WalletScanner:
 
     async def _evm_balance(self, addr, key):
         base = "https://api.etherscan.io/api" if BLOCKCHAIN == "ethereum" else "https://api.bscscan.com/api"
-        params = {"module":"account","action":"balance","address":addr,"tag":"latest","apikey":key}
+        params = {
+            "module": "account",
+            "action": "balance",
+            "address": addr,
+            "tag": "latest",
+            "apikey": key
+        }
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(base, params=params, timeout=10) as resp:
@@ -336,7 +376,7 @@ class WalletScanner:
                     await self.alert_mgr.send_alert(mnemonic, balances, total, wallet_id)
                     self.stats['alerts'] += 1
                 if self.stats['checked'] % 100 == 0:
-                    rate = self.stats['funded'] / max(self.stats['checked'],1) * 1e6
+                    rate = self.stats['funded'] / max(self.stats['checked'], 1) * 1e6
                     logger.info(f"📊 Checked:{self.stats['checked']} | Funded:{self.stats['funded']} | Rate:{rate:.2f}/M")
                 await asyncio.sleep(0.02)
             except asyncio.CancelledError:
@@ -349,21 +389,43 @@ class WalletScanner:
                     errors = 0
 
     async def monitor(self):
-        # Simple monitoring every 5 minutes
         while not self._shutdown:
             await asyncio.sleep(300)
             logger.info(f"📊 Health: Checked={self.stats['checked']}, Funded={self.stats['funded']}, Alerts={self.stats['alerts']}")
-            # Clean caches
             self.balance_cache.clear_expired(CACHE_TTL)
             self.seen_cache.clear_expired(86400)
 
     def stop(self):
         self._shutdown = True
 
+# ---------- Simple HTTP Server (for Render health checks) ----------
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'OK')
+    def log_message(self, format, *args):
+        pass  # suppress logs
+
+def start_http_server(port: int):
+    server = HTTPServer(('0.0.0.0', port), HealthHandler)
+    server.serve_forever()
+
 # ---------- Main ----------
 async def main():
+    # Start HTTP server in a background thread
+    port = int(os.environ.get("PORT", 10000))
+    http_thread = threading.Thread(target=start_http_server, args=(port,), daemon=True)
+    http_thread.start()
+    logger.info(f"🌐 HTTP health server running on port {port}")
+
     scanner = WalletScanner()
-    logger.info(f"🚀 Starting {BLOCKCHAIN.upper()} scanner with Discord alerts only (in-memory)")
+    logger.info(f"🚀 Starting {BLOCKCHAIN.upper()} scanner with Discord alerts (in-memory)")
+    if scanner.key_rotator:
+        logger.info(f"🔑 Loaded {len(scanner.key_rotator.keys)} API keys for rotation")
+    else:
+        logger.info("ℹ️  No API keys loaded (Bitcoin mode or keys missing)")
     logger.info(f"📊 Workers:{MAX_WORKERS} | Min Balance:{ALERT_MIN_BALANCE} | Cooldown:{ALERT_COOLDOWN}s")
     await scanner.alert_mgr.start()
     monitor_task = asyncio.create_task(scanner.monitor())
