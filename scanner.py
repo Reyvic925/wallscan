@@ -39,12 +39,14 @@ ALERT_MIN_BALANCE = float(os.environ.get("ALERT_MIN_BALANCE", "0.001"))
 ALERT_COOLDOWN = int(os.environ.get("ALERT_COOLDOWN", "300"))
 ALERT_MAX_PER_HOUR = int(os.environ.get("ALERT_MAX_PER_HOUR", "5"))
 
-MAX_WORKERS = max(1, int(os.environ.get("MAX_WORKERS", "1")))
+MAX_WORKERS = max(1, int(os.environ.get("MAX_WORKERS", "2")))
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "300"))
 NUM_ADDRESSES = int(os.environ.get("NUM_ADDRESSES", "1"))
+
+# OPTIMIZED: Batch size of 50 balances RPC efficiency with WAF avoidance
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "50"))
 
-# ----- Public RPC endpoints (UPDATED: Massive Ethereum list for maximum fault tolerance) -----
+# ----- Public RPC endpoints -----
 RPC_ENDPOINTS = {
     "ethereum": [
         "https://ethereum-rpc.publicnode.com",
@@ -80,16 +82,8 @@ RPC_ENDPOINTS = {
         "https://ethereum.rpc.thirdweb.com",
         "https://api.uniblock.dev/uni/v1/json-rpc?chainId=1"
     ],
-    "bsc": [
-        "https://bsc-rpc.publicnode.com",
-        "https://bsc-dataseed.binance.org",
-        "https://rpc.ankr.com/bsc"
-    ],
-    "polygon": [
-        "https://polygon-rpc.publicnode.com",
-        "https://polygon-rpc.com",
-        "https://rpc.ankr.com/polygon"
-    ],
+    "bsc": ["https://bsc-rpc.publicnode.com", "https://bsc-dataseed.binance.org", "https://rpc.ankr.com/bsc"],
+    "polygon": ["https://polygon-rpc.publicnode.com", "https://polygon-rpc.com", "https://rpc.ankr.com/polygon"],
     "avalanche": ["https://avalanche-rpc.publicnode.com", "https://api.avax.network/ext/bc/C/rpc"],
     "arbitrum": ["https://arbitrum-rpc.publicnode.com", "https://arb1.arbitrum.io/rpc"],
     "optimism": ["https://optimism-rpc.publicnode.com", "https://mainnet.optimism.io"],
@@ -120,10 +114,6 @@ logger = logging.getLogger(__name__)
 
 # ---------- RPC Rotator for Load Balancing & Fault Tolerance ----------
 class RPCRotator:
-    """
-    Manages a list of RPC endpoints, distributing requests in a Round-Robin fashion.
-    Includes async locking to ensure thread-safe index increments across multiple workers.
-    """
     def __init__(self, urls: List[str]):
         self.urls = urls
         self.index = 0
@@ -229,7 +219,7 @@ class AlertManager:
                 {"name": "🆔 Wallet ID", "value": str(wallet_id), "inline": True},
                 {"name": "🕐 Found At", "value": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"), "inline": True}
             ],
-            "footer": {"text": f"Scanner v4.2 (32+ RPC Rotation) | {BLOCKCHAIN.upper()}"},
+            "footer": {"text": f"Scanner v4.5 (HEAD Request Support) | {BLOCKCHAIN.upper()}"},
             "timestamp": datetime.utcnow().isoformat()
         }
         async with aiohttp.ClientSession() as session:
@@ -249,7 +239,6 @@ class WalletScanner:
         self._shutdown = False
         self.wallet_counter = 0
 
-        # Thread pool for CPU‑bound derivation
         self.executor = ThreadPoolExecutor(max_workers=MAX_WORKERS * 2)
 
         if BLOCKCHAIN == "bitcoin":
@@ -269,7 +258,6 @@ class WalletScanner:
             logger.error(f"Mnemonic gen error: {e}")
             return None
 
-    # ---- Synchronous derivation (runs in thread pool) ----
     def _derive_addresses_sync(self, mnemonic: str) -> List[str]:
         addresses = []
         if BLOCKCHAIN == "bitcoin":
@@ -325,9 +313,7 @@ class WalletScanner:
         except:
             return None
 
-    # ----- Batch balance fetch (EVM only) with Node Rotation -----
     async def _fetch_balances_batch(self, addresses: List[str]) -> Dict[str, float]:
-        """Fetch balances using JSON-RPC batch, with automatic node rotation on failure."""
         if not addresses:
             return {}
             
@@ -360,7 +346,7 @@ class WalletScanner:
                         
                         elif resp.status == 429:
                             logger.warning(f"Rate limited (429) on {current_rpc_url}. Rotating to next node...")
-                            await asyncio.sleep(1) # Brief backoff before trying next node
+                            await asyncio.sleep(1)
                             continue 
                         
                         else:
@@ -377,9 +363,7 @@ class WalletScanner:
         logger.error("All RPC nodes failed to respond. Returning zero balances.")
         return {addr: 0.0 for addr in addresses}
 
-    # ----- Get balances with caching and batch fallback -----
     async def get_balances_batch(self, addresses: List[str]) -> Dict[str, float]:
-        """Get balances, using cache for known ones, batch-fetch the rest."""
         now = time.time()
         result = {}
         to_fetch = []
@@ -397,7 +381,6 @@ class WalletScanner:
                 result[addr] = bal
         return result
 
-    # ----- Bitcoin balance (unchanged, single-address API) -----
     async def _btc_balance(self, addr):
         try:
             async with aiohttp.ClientSession() as session:
@@ -409,10 +392,10 @@ class WalletScanner:
             pass
         return 0.0
 
-    # ----- Main scan loop with batching -----
+    # ---------- OPTIMIZED SCAN LOOP ----------
     async def scan_loop(self):
         errors = 0
-        pending = []   # list of (mnemonic, addresses_list)
+        pending = []
         while not self._shutdown:
             try:
                 mnemonic = self.generate_mnemonic()
@@ -479,9 +462,9 @@ class WalletScanner:
                             elapsed = time.time() - self.stats['start_time']
                             logger.info(f"📊 Checked:{self.stats['checked']} | Funded:{self.stats['funded']} | Rate:{rate:.2f}/M | {elapsed:.0f}s elapsed")
 
+                    # ✅ OPTIMIZED: Polite throttling applied ONLY after a batch network request
+                    await asyncio.sleep(random.uniform(0.1, 0.3))
                     pending = []
-
-                await asyncio.sleep(0.001)
 
             except asyncio.CancelledError:
                 break
@@ -510,6 +493,14 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
         self.wfile.write(b'OK')
+        
+    def do_HEAD(self):
+        # Respond to HEAD requests (commonly used by uptime monitors)
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        # Intentionally no body written for HEAD requests
+        
     def log_message(self, format, *args):
         pass
 
@@ -530,10 +521,10 @@ async def main():
     
     if BLOCKCHAIN != "bitcoin":
         logger.info(f"🔗 Using {len(scanner.rpc_rotator.urls)} rotating RPC endpoints for {BLOCKCHAIN.upper()}")
+        logger.info("🛡️ Batch-level throttling enabled to prevent WAF/IP bans without bottlenecking CPU")
     else:
         logger.info("🔗 Using mempool.space for Bitcoin")
 
-    # Startup test
     logger.info("🧪 Running startup test...")
     test_mnemonic = scanner.generate_mnemonic()
     if test_mnemonic:
@@ -545,7 +536,6 @@ async def main():
 
     if BLOCKCHAIN != "bitcoin":
         test_addr = "0x0000000000000000000000000000000000000000"
-        # Test batch endpoint (this will naturally use the rotator)
         balances = await scanner._fetch_balances_batch([test_addr])
         if balances and balances.get(test_addr) is not None:
             logger.info(f"✅ Batch RPC rotation works (balance of null address: {balances[test_addr]:.18f} {BLOCKCHAIN.upper()})")
