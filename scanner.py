@@ -9,7 +9,7 @@ import secrets
 import threading
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
-from collections import OrderedDict, deque
+from collections import OrderedDict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from mnemonic import Mnemonic
@@ -25,8 +25,6 @@ if BLOCKCHAIN not in ["bitcoin", "ethereum", "bsc"]:
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
 if not DISCORD_WEBHOOK:
     raise ValueError("DISCORD_WEBHOOK environment variable is required")
-if not DISCORD_WEBHOOK.startswith("https://discord.com/api/webhooks/"):
-    raise ValueError("Invalid DISCORD_WEBHOOK URL")
 
 ALERT_MIN_BALANCE = float(os.environ.get("ALERT_MIN_BALANCE", "0.001"))
 ALERT_COOLDOWN = int(os.environ.get("ALERT_COOLDOWN", "300"))
@@ -34,8 +32,8 @@ ALERT_MAX_PER_HOUR = int(os.environ.get("ALERT_MAX_PER_HOUR", "5"))
 
 MAX_WORKERS = max(1, int(os.environ.get("MAX_WORKERS", "3")))
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "300"))
+NUM_ADDRESSES = int(os.environ.get("NUM_ADDRESSES", "5"))  # Reduced from 20 for speed
 
-# API keys – support multiple keys
 def parse_keys(env_var: str) -> List[str]:
     return [k.strip() for k in env_var.split(",") if k.strip()]
 
@@ -44,15 +42,16 @@ if BLOCKCHAIN == "ethereum":
         [os.environ.get("ETHERSCAN_KEY", "")] if os.environ.get("ETHERSCAN_KEY", "") else []
     )
     if not ETHERSCAN_KEYS:
-        logging.warning("No Etherscan API keys provided. Rate limits will be strict.")
+        logging.warning("No Etherscan API keys provided.")
+    else:
+        logging.info(f"Loaded {len(ETHERSCAN_KEYS)} Etherscan API keys")
 elif BLOCKCHAIN == "bsc":
     BSCSCAN_KEYS = parse_keys(os.environ.get("BSCSCAN_KEYS", "")) or (
         [os.environ.get("BSCSCAN_KEY", "")] if os.environ.get("BSCSCAN_KEY", "") else []
     )
     if not BSCSCAN_KEYS:
-        logging.warning("No BscScan API keys provided. Rate limits will be strict.")
+        logging.warning("No BscScan API keys provided.")
 
-# Logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -92,6 +91,7 @@ class KeyRotator:
         self.keys = keys
         self.index = 0
         self._lock = asyncio.Lock()
+        logger.info(f"🔑 KeyRotator initialized with {len(keys)} keys")
 
     async def get_key(self) -> Optional[str]:
         if not self.keys:
@@ -101,7 +101,7 @@ class KeyRotator:
             self.index = (self.index + 1) % len(self.keys)
             return key
 
-# ---------- Alert Manager (Discord only, in-memory) ----------
+# ---------- Alert Manager ----------
 class AlertManager:
     def __init__(self):
         self.queue = asyncio.Queue()
@@ -177,43 +177,6 @@ class AlertManager:
                 if resp.status not in (200, 204):
                     raise Exception(f"Discord returned {resp.status}")
 
-# ---------- API rotator ----------
-class APIRotator:
-    def __init__(self, endpoints, cooldown=60):
-        self.endpoints = endpoints
-        self.cooldown = cooldown
-        self.failures = {}
-
-    async def get(self, path, params=None, json_payload=None):
-        for name, base in self.endpoints:
-            if name in self.failures and time.time() - self.failures[name] < self.cooldown:
-                continue
-            url = base + path
-            for attempt in range(3):
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        if json_payload:
-                            async with session.post(url, json=json_payload, timeout=15) as resp:
-                                if resp.status == 200:
-                                    return await resp.json()
-                                elif resp.status == 429:
-                                    await asyncio.sleep(2 ** attempt)
-                                    continue
-                        else:
-                            async with session.get(url, params=params, timeout=15) as resp:
-                                if resp.status == 200:
-                                    data = await resp.json()
-                                    if isinstance(data, dict) and data.get('status') == '0':
-                                        continue
-                                    return data
-                                elif resp.status == 429:
-                                    await asyncio.sleep(2 ** attempt)
-                                    continue
-                        self.failures[name] = time.time()
-                except Exception:
-                    self.failures[name] = time.time()
-        return None
-
 # ---------- Scanner ----------
 class WalletScanner:
     def __init__(self):
@@ -248,7 +211,7 @@ class WalletScanner:
             coin_type = 0 if BLOCKCHAIN == "bitcoin" else (60 if BLOCKCHAIN == "ethereum" else 714)
             addresses = []
             for change in (0,):
-                for idx in range(20):
+                for idx in range(NUM_ADDRESSES):  # Configurable, default 5
                     try:
                         child_key = root_key \
                             .ChildKey(44 + 0x80000000) \
@@ -294,8 +257,9 @@ class WalletScanner:
                 to_fetch.append(addr)
 
         if to_fetch:
-            async with self.semaphore:
-                for addr in to_fetch:
+            sem = asyncio.Semaphore(10)
+            async def fetch_one(addr):
+                async with sem:
                     try:
                         if BLOCKCHAIN == "bitcoin":
                             bal = await self._btc_balance(addr)
@@ -303,11 +267,14 @@ class WalletScanner:
                             key = await self.key_rotator.get_key() if self.key_rotator else ""
                             bal = await self._evm_balance(addr, key)
                         self.balance_cache.set(addr, bal, time.time())
-                        balances[addr] = bal
-                        await asyncio.sleep(0.1)
+                        return addr, bal
                     except Exception as e:
                         logger.debug(f"Balance check failed for {addr}: {e}")
-                        balances[addr] = 0.0
+                        return addr, 0.0
+            tasks = [fetch_one(addr) for addr in to_fetch]
+            results = await asyncio.gather(*tasks)
+            for addr, bal in results:
+                balances[addr] = bal
         return balances
 
     async def _btc_balance(self, addr):
@@ -337,14 +304,15 @@ class WalletScanner:
                         data = await resp.json()
                         if data.get('status') == '1':
                             return int(data['result']) / 1e18
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"EVM balance error for {addr}: {e}")
         return 0.0
 
     async def scan_loop(self):
         errors = 0
         while not self._shutdown:
             try:
+                # Generate mnemonic
                 mnemonic = self.generate_mnemonic()
                 if not mnemonic:
                     errors += 1
@@ -352,21 +320,37 @@ class WalletScanner:
                         await asyncio.sleep(10)
                         errors = 0
                     continue
+
+                # Check cache
                 cached, _ = self.seen_cache.get(mnemonic)
                 if cached:
                     continue
                 self.seen_cache.set(mnemonic, True)
-                addresses = await self.derive_addresses(mnemonic)
+
+                # Derive addresses with timeout
+                try:
+                    addresses = await asyncio.wait_for(
+                        self.derive_addresses(mnemonic),
+                        timeout=15.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"⏰ Derivation timeout for {mnemonic[:10]}...")
+                    continue
+
                 if not addresses:
                     errors += 1
                     if errors > 5:
                         await asyncio.sleep(5)
                         errors = 0
                     continue
+
+                # Check balances
                 balances = await self.get_balances(addresses)
                 total = sum(balances.values())
                 self.stats['checked'] += 1
                 errors = 0
+
+                # Check if funded
                 funded = total > ALERT_MIN_BALANCE
                 if funded:
                     self.wallet_counter += 1
@@ -375,10 +359,15 @@ class WalletScanner:
                     logger.info(f"💎 FUNDED! ID:{wallet_id} | Total:{total:.8f} {BLOCKCHAIN.upper()}")
                     await self.alert_mgr.send_alert(mnemonic, balances, total, wallet_id)
                     self.stats['alerts'] += 1
-                if self.stats['checked'] % 100 == 0:
+
+                # Log progress every 10 checks
+                if self.stats['checked'] % 10 == 0:
                     rate = self.stats['funded'] / max(self.stats['checked'], 1) * 1e6
-                    logger.info(f"📊 Checked:{self.stats['checked']} | Funded:{self.stats['funded']} | Rate:{rate:.2f}/M")
-                await asyncio.sleep(0.02)
+                    elapsed = time.time() - self.stats['start_time']
+                    logger.info(f"📊 Checked:{self.stats['checked']} | Funded:{self.stats['funded']} | Rate:{rate:.2f}/M | {elapsed:.0f}s elapsed")
+
+                await asyncio.sleep(0.01)
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -398,7 +387,7 @@ class WalletScanner:
     def stop(self):
         self._shutdown = True
 
-# ---------- Simple HTTP Server (for Render health checks) ----------
+# ---------- HTTP Server ----------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -406,7 +395,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b'OK')
     def log_message(self, format, *args):
-        pass  # suppress logs
+        pass
 
 def start_http_server(port: int):
     server = HTTPServer(('0.0.0.0', port), HealthHandler)
@@ -414,19 +403,30 @@ def start_http_server(port: int):
 
 # ---------- Main ----------
 async def main():
-    # Start HTTP server in a background thread
     port = int(os.environ.get("PORT", 10000))
     http_thread = threading.Thread(target=start_http_server, args=(port,), daemon=True)
     http_thread.start()
     logger.info(f"🌐 HTTP health server running on port {port}")
 
     scanner = WalletScanner()
-    logger.info(f"🚀 Starting {BLOCKCHAIN.upper()} scanner with Discord alerts (in-memory)")
+    logger.info(f"🚀 Starting {BLOCKCHAIN.upper()} scanner with Discord alerts")
     if scanner.key_rotator:
         logger.info(f"🔑 Loaded {len(scanner.key_rotator.keys)} API keys for rotation")
     else:
         logger.info("ℹ️  No API keys loaded (Bitcoin mode or keys missing)")
-    logger.info(f"📊 Workers:{MAX_WORKERS} | Min Balance:{ALERT_MIN_BALANCE} | Cooldown:{ALERT_COOLDOWN}s")
+    logger.info(f"📊 Workers:{MAX_WORKERS} | Min Balance:{ALERT_MIN_BALANCE} | Addresses per wallet:{NUM_ADDRESSES}")
+
+    # Startup test
+    logger.info("🧪 Running startup test...")
+    test_mnemonic = scanner.generate_mnemonic()
+    if test_mnemonic:
+        logger.info(f"✅ Mnemonic generated: {test_mnemonic[:20]}...")
+        test_addresses = await scanner.derive_addresses(test_mnemonic)
+        logger.info(f"✅ Derived {len(test_addresses)} addresses")
+    else:
+        logger.error("❌ Failed to generate test mnemonic!")
+    logger.info("🧪 Startup test complete – starting main loop")
+
     await scanner.alert_mgr.start()
     monitor_task = asyncio.create_task(scanner.monitor())
     tasks = [asyncio.create_task(scanner.scan_loop()) for _ in range(MAX_WORKERS)]
