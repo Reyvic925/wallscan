@@ -42,7 +42,7 @@ ALERT_MAX_PER_HOUR = int(os.environ.get("ALERT_MAX_PER_HOUR", "5"))
 
 MAX_WORKERS = max(1, int(os.environ.get("MAX_WORKERS", "2")))
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "300"))
-NUM_ADDRESSES = int(os.environ.get("NUM_ADDRESSES", "1"))   # per address type
+NUM_ADDRESSES = int(os.environ.get("NUM_ADDRESSES", "1"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "50"))
 
 # ----- Public RPC endpoints (EVM only) -----
@@ -216,10 +216,10 @@ class AlertManager:
                  "value": "\n".join([f"`{addr}`: {bal:.8f}" for addr, bal in list(funded.items())[:10]]),
                  "inline": False},
                 {"name": "🆔 Wallet ID", "value": str(wallet_id), "inline": True},
-                {"name": "🕐 Found At", "value": datetime.now(timezone.UTC).strftime("%Y-%m-%d %H:%M:%S UTC"), "inline": True}
+                {"name": "🕐 Found At", "value": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"), "inline": True}
             ],
-            "footer": {"text": f"Scanner v4.9 (BTC multi-type) | {BLOCKCHAIN.upper()}"},
-            "timestamp": datetime.now(timezone.UTC).isoformat()
+            "footer": {"text": f"Scanner v4.9.1 (BTC multi-type) | {BLOCKCHAIN.upper()}"},
+            "timestamp": datetime.now(timezone.utc).isoformat()
         }
         async with aiohttp.ClientSession() as session:
             async with session.post(DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=10) as resp:
@@ -231,13 +231,13 @@ class AlertManager:
             "title": f"🚀 Scanner Started ({BLOCKCHAIN.upper()})",
             "color": 0x00aaff,
             "fields": [
-                {"name": "🕐 Started At", "value": datetime.now(timezone.UTC).strftime("%Y-%m-%d %H:%M:%S UTC"), "inline": True},
+                {"name": "🕐 Started At", "value": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"), "inline": True},
                 {"name": "⚙️ Configuration",
                  "value": f"Workers: {MAX_WORKERS}\nBatch size: {BATCH_SIZE}\nMin balance: {ALERT_MIN_BALANCE}\nAddresses per wallet: {NUM_ADDRESSES}",
                  "inline": False}
             ],
             "footer": {"text": "Test notification – scanner is online"},
-            "timestamp": datetime.now(timezone.UTC).isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat()
         }
         try:
             async with aiohttp.ClientSession() as session:
@@ -259,28 +259,25 @@ def hash160(data):
 def p2pkh_address(pubkey):
     """P2PKH (Legacy) address starting with 1"""
     h160 = hash160(pubkey)
-    # version 0x00 for mainnet
     versioned = b'\x00' + h160
     checksum = hashlib.sha256(hashlib.sha256(versioned).digest()).digest()[:4]
     return base58.b58encode(versioned + checksum).decode()
 
 def p2sh_segwit_address(pubkey):
-    """P2SH-SegWit address starting with 3 (redeem script: 0x0014 + hash160(pubkey))"""
+    """P2SH-SegWit address starting with 3"""
     h160 = hash160(pubkey)
-    redeem_script = b'\x00\x14' + h160  # OP_0 + push 20 bytes
+    redeem_script = b'\x00\x14' + h160
     script_hash = hash160(redeem_script)
-    versioned = b'\x05' + script_hash  # 0x05 for P2SH mainnet
+    versioned = b'\x05' + script_hash
     checksum = hashlib.sha256(hashlib.sha256(versioned).digest()).digest()[:4]
     return base58.b58encode(versioned + checksum).decode()
 
 def native_segwit_address(pubkey):
     """Native SegWit (bech32) address starting with bc1"""
     h160 = hash160(pubkey)
-    # convert to 5-bit words for bech32
     data = convertbits(h160, 8, 5)
     if data is None:
         return None
-    # witness version 0x00 -> first data byte 0
     return bech32_encode("bc", [0] + data)
 
 # ---------- Scanner ----------
@@ -322,13 +319,11 @@ class WalletScanner:
             try:
                 seed = self.mnemo.to_seed(mnemonic)
                 root_key = BIP32Key.fromEntropy(seed)
-                # For each address type (purpose)
                 for purpose, addr_func in [
                     (44, p2pkh_address),      # Legacy
                     (49, p2sh_segwit_address),# P2SH-SegWit
                     (84, native_segwit_address)# Native SegWit
                 ]:
-                    # Derive the purpose-level key once
                     purpose_key = root_key.ChildKey(purpose + 0x80000000)
                     coin_key = purpose_key.ChildKey(0 + 0x80000000)  # Bitcoin mainnet
                     account_key = coin_key.ChildKey(0 + 0x80000000)  # account 0
@@ -349,7 +344,6 @@ class WalletScanner:
                 logger.error(f"BTC derivation error: {e}")
                 return []
         else:
-            # EVM: single address per index (unchanged)
             try:
                 for change in (0,):
                     for idx in range(NUM_ADDRESSES):
@@ -417,7 +411,6 @@ class WalletScanner:
         if not addresses:
             return {}
         
-        # Try blockchair with proper headers and retry
         url = f"https://api.blockchair.com/bitcoin/dashboards/addresses/{','.join(addresses)}"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         for attempt in range(2):
@@ -444,7 +437,6 @@ class WalletScanner:
                 logger.warning(f"Blockchair error: {e}")
                 await asyncio.sleep(1)
         
-        # Fallback: concurrent mempool.space requests
         logger.info(f"Falling back to concurrent mempool.space requests for {len(addresses)} addresses")
         sem = asyncio.Semaphore(10)
         async def fetch_one(addr):
