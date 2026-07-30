@@ -1,7 +1,8 @@
-aiohttp>=3.8.0
-mnemonic>=0.20
-bip32utils>=0.3.post4
-eth-keys>=0.4.0
-bech32>=1.2.0
-base58>=2.1.0
-psutil>=5.9.0
+aiohttp
+mnemonic
+bip32utils
+eth-keys
+bech32
+base58
+psutil
+eth_account
